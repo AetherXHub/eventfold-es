@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::command::CommandEnvelope;
+use crate::error::DispatchError;
 use crate::projection::CursorPosition;
 use crate::storage::StreamLayout;
 
@@ -228,6 +229,8 @@ impl<PM: ProcessManager> ProcessManagerRunner<PM> {
     ///
     /// Returns `io::Error` if listing streams or reading events fails.
     pub(crate) fn catch_up(&mut self) -> io::Result<Vec<CommandEnvelope>> {
+        let _span = tracing::debug_span!("pm_catchup", pm_name = PM::NAME,).entered();
+
         let mut envelopes = Vec::new();
 
         for &aggregate_type in self.checkpoint.state.subscriptions() {
@@ -351,31 +354,6 @@ impl<PM: ProcessManager> ProcessManagerCatchUp for ProcessManagerRunner<PM> {
 }
 
 // --- Dispatch infrastructure ---
-
-/// Errors that can occur when dispatching a command envelope.
-///
-/// Produced by the dispatch layer when a process manager's command envelope
-/// cannot be routed to or executed by the target aggregate.
-#[derive(Debug, thiserror::Error)]
-pub enum DispatchError {
-    /// No dispatcher registered for the target aggregate type.
-    #[error("unknown aggregate type: {0}")]
-    UnknownAggregateType(String),
-
-    /// The command JSON could not be deserialized into the target
-    /// aggregate's command type.
-    #[error("command deserialization failed: {0}")]
-    Deserialization(serde_json::Error),
-
-    /// The target aggregate's command handler rejected the command or
-    /// an I/O error occurred during execution.
-    #[error("command execution failed: {0}")]
-    Execution(Box<dyn std::error::Error + Send + Sync>),
-
-    /// An I/O error occurred during dispatch (e.g. directory creation).
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-}
 
 /// Type-erased dispatcher for a single aggregate type.
 ///

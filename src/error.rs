@@ -57,6 +57,39 @@ pub enum StateError {
     ActorGone,
 }
 
+/// Errors that can occur when dispatching a command.
+///
+/// Produced by the dispatch layer ([`CommandBus`](crate::CommandBus) or
+/// process manager dispatch) when a command cannot be routed to or executed
+/// by the target aggregate.
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    /// No dispatcher registered for the target aggregate type.
+    #[error("unknown aggregate type: {0}")]
+    UnknownAggregateType(String),
+
+    /// No route registered for the command type.
+    ///
+    /// Returned by [`CommandBus::dispatch`](crate::CommandBus::dispatch) when
+    /// the command's concrete type has not been registered via `register::<A>()`.
+    #[error("no route registered for command type")]
+    UnknownCommand,
+
+    /// The command JSON could not be deserialized into the target
+    /// aggregate's command type.
+    #[error("command deserialization failed: {0}")]
+    Deserialization(serde_json::Error),
+
+    /// The target aggregate's command handler rejected the command or
+    /// an I/O error occurred during execution.
+    #[error("command execution failed: {0}")]
+    Execution(Box<dyn std::error::Error + Send + Sync>),
+
+    /// An I/O error occurred during dispatch (e.g. directory creation).
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

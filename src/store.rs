@@ -6,10 +6,11 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::RwLock;
 
-use crate::actor::{AggregateHandle, spawn_actor};
+use crate::actor::{ActorConfig, AggregateHandle, spawn_actor_with_config};
 use crate::aggregate::Aggregate;
 use crate::process_manager::{
     AggregateDispatcher, ProcessManagerCatchUp, ProcessManagerReport, ProcessManagerRunner,
@@ -41,6 +42,9 @@ type ProcessManagerList = Vec<std::sync::Mutex<Box<dyn ProcessManagerCatchUp>>>;
 /// Type-erased dispatcher map keyed by aggregate type name.
 type DispatcherMap = HashMap<String, Box<dyn AggregateDispatcher>>;
 
+/// Default idle timeout for actors: 5 minutes.
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Central registry that manages aggregate instance lifecycles.
 ///
 /// The store handles directory creation, actor spawning, and handle caching.
@@ -64,6 +68,7 @@ pub struct AggregateStore {
     projections: Arc<std::sync::RwLock<ProjectionMap>>,
     process_managers: Arc<std::sync::RwLock<ProcessManagerList>>,
     dispatchers: Arc<DispatcherMap>,
+    idle_timeout: Duration,
 }
 
 // Manual `Debug` because `dyn Any` is not `Debug` and we don't want to
@@ -106,6 +111,7 @@ impl AggregateStore {
             projections: Arc::new(std::sync::RwLock::new(HashMap::new())),
             process_managers: Arc::new(std::sync::RwLock::new(Vec::new())),
             dispatchers: Arc::new(HashMap::new()),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
         })
     }
 
@@ -134,9 +140,17 @@ impl AggregateStore {
             let cache = self.cache.read().await;
             if let Some(boxed) = cache.get(&key)
                 && let Some(handle) = boxed.downcast_ref::<AggregateHandle<A>>()
+                && handle.is_alive()
             {
                 return Ok(handle.clone());
             }
+        }
+
+        // If we get here, either the handle is missing or the actor has
+        // exited (e.g. idle timeout). Evict any stale entry and re-spawn.
+        {
+            let mut cache = self.cache.write().await;
+            cache.remove(&key);
         }
 
         // Slow path: create stream directory and spawn actor.
@@ -148,7 +162,16 @@ impl AggregateStore {
                 .await
                 .map_err(io::Error::other)??;
 
-        let handle = spawn_actor::<A>(&stream_dir)?;
+        tracing::debug!(
+            aggregate_type = A::AGGREGATE_TYPE,
+            instance_id = %id,
+            "spawning actor"
+        );
+
+        let config = ActorConfig {
+            idle_timeout: self.idle_timeout,
+        };
+        let handle = spawn_actor_with_config::<A>(&stream_dir, config)?;
 
         let mut cache = self.cache.write().await;
         cache.insert(key, Box::new(handle.clone()));
@@ -202,6 +225,7 @@ impl AggregateStore {
             projection_factories: Vec::new(),
             process_manager_factories: Vec::new(),
             dispatcher_factories: Vec::new(),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
 
@@ -291,7 +315,14 @@ impl AggregateStore {
                 let agg_type = &envelope.aggregate_type;
                 match self.dispatchers.get(agg_type) {
                     Some(dispatcher) => match dispatcher.dispatch(self, envelope.clone()).await {
-                        Ok(()) => report.dispatched += 1,
+                        Ok(()) => {
+                            tracing::info!(
+                                target_type = %agg_type,
+                                target_id = %envelope.instance_id,
+                                "dispatching command"
+                            );
+                            report.dispatched += 1;
+                        }
                         Err(e) => {
                             tracing::error!(
                                 aggregate_type = %agg_type,
@@ -382,6 +413,7 @@ pub struct AggregateStoreBuilder {
     projection_factories: Vec<(String, ProjectionFactory)>,
     process_manager_factories: Vec<(String, ProcessManagerFactory)>,
     dispatcher_factories: Vec<(String, DispatcherFactory)>,
+    idle_timeout: Duration,
 }
 
 impl AggregateStoreBuilder {
@@ -435,6 +467,40 @@ impl AggregateStoreBuilder {
                 ))
             }),
         ));
+        self
+    }
+
+    /// Register an aggregate type as a dispatch target for process managers.
+    ///
+    /// This allows [`CommandEnvelope`](crate::command::CommandEnvelope)s
+    /// targeting this aggregate type to be deserialized and routed. The
+    /// aggregate's `Command` type must implement `DeserializeOwned`.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `A` - A type implementing [`Aggregate`] with `Command: DeserializeOwned`.
+    ///
+    /// # Returns
+    ///
+    /// `self` for method chaining.
+    /// Set the idle timeout for actor eviction.
+    ///
+    /// Actors that receive no messages for this duration will shut down,
+    /// releasing their file lock. The next [`get`](AggregateStore::get) call
+    /// transparently re-spawns the actor and recovers state from disk.
+    ///
+    /// Defaults to 5 minutes. Pass `Duration::from_secs(u64::MAX / 2)` to
+    /// effectively disable idle eviction.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - How long an idle actor waits before shutting down.
+    ///
+    /// # Returns
+    ///
+    /// `self` for method chaining.
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
         self
     }
 
@@ -507,6 +573,7 @@ impl AggregateStoreBuilder {
             projections: Arc::new(std::sync::RwLock::new(projections)),
             process_managers: Arc::new(std::sync::RwLock::new(process_managers)),
             dispatchers: Arc::new(dispatchers),
+            idle_timeout: self.idle_timeout,
         })
     }
 }
@@ -1107,5 +1174,73 @@ mod tests {
         // Should only dispatch the 1 new event, not replay old ones.
         assert_eq!(report.dispatched, 1);
         assert_eq!(report.dead_lettered, 0);
+    }
+
+    // --- Idle eviction tests ---
+
+    #[tokio::test]
+    async fn idle_actor_evicted_and_respawned() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::builder(tmp.path())
+            .idle_timeout(Duration::from_millis(200))
+            .open()
+            .await
+            .expect("builder open should succeed");
+
+        // Execute a command.
+        let handle = store
+            .get::<Counter>("c-1")
+            .await
+            .expect("get should succeed");
+        handle
+            .execute(CounterCommand::Increment, CommandContext::default())
+            .await
+            .expect("increment should succeed");
+
+        // Wait for the actor to idle out.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !handle.is_alive(),
+            "actor should be dead after idle timeout"
+        );
+
+        // A new `get` should transparently re-spawn.
+        let handle2 = store
+            .get::<Counter>("c-1")
+            .await
+            .expect("get after eviction should succeed");
+        let state = handle2.state().await.expect("state should succeed");
+        assert_eq!(state.value, 1, "state should reflect persisted events");
+    }
+
+    #[tokio::test]
+    async fn rapid_commands_keep_actor_alive() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::builder(tmp.path())
+            .idle_timeout(Duration::from_millis(300))
+            .open()
+            .await
+            .expect("builder open should succeed");
+
+        let handle = store
+            .get::<Counter>("c-1")
+            .await
+            .expect("get should succeed");
+
+        let ctx = CommandContext::default();
+        for _ in 0..5 {
+            handle
+                .execute(CounterCommand::Increment, ctx.clone())
+                .await
+                .expect("execute should succeed");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            handle.is_alive(),
+            "actor should remain alive during activity"
+        );
+        let state = handle.state().await.expect("state should succeed");
+        assert_eq!(state.value, 5);
     }
 }

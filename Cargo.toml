@@ -2,6 +2,12 @@
 name = "eventfold-es"
 version = "0.1.0"
 edition = "2024"
+description = "Embedded event-sourcing framework built on eventfold"
+license = "MIT"
+repository = "https://github.com/aetherxhub/eventfold-es"
+readme = "README.md"
+keywords = ["event-sourcing", "cqrs", "aggregate", "eventfold", "embedded"]
+categories = ["data-structures", "database"]
 
 [lib]
 
@@ -10,7 +16,7 @@ eventfold = "0.2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]

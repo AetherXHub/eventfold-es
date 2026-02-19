@@ -244,6 +244,9 @@ impl<P: Projection> ProjectionRunner<P> {
     /// Returns `io::Error` if listing streams, reading events, or saving
     /// the checkpoint fails.
     pub(crate) fn catch_up(&mut self) -> io::Result<()> {
+        let _span =
+            tracing::debug_span!("projection_catchup", projection_name = P::NAME,).entered();
+
         for &aggregate_type in self.checkpoint.state.subscriptions() {
             let instance_ids = self.layout.list_streams(aggregate_type)?;
             for instance_id in &instance_ids {
@@ -264,6 +267,7 @@ impl<P: Projection> ProjectionRunner<P> {
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(e),
                 };
+                let mut count = 0u64;
                 for result in iter {
                     let (event, next_offset, line_hash) = result?;
                     self.checkpoint
@@ -275,6 +279,14 @@ impl<P: Projection> ProjectionRunner<P> {
                             offset: next_offset,
                             hash: line_hash,
                         },
+                    );
+                    count += 1;
+                }
+                if count > 0 {
+                    tracing::debug!(
+                        stream = %instance_id,
+                        count,
+                        "events applied"
                     );
                 }
             }

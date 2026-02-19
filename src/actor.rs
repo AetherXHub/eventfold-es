@@ -10,6 +10,7 @@
 
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use eventfold::{EventReader, EventWriter, View};
 use tokio::sync::{mpsc, oneshot};
@@ -24,6 +25,16 @@ use crate::error::{ExecuteError, StateError};
 /// conflicts cannot occur. Retained for future `append_if` support.
 #[allow(dead_code)]
 const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// Configuration for the actor loop.
+///
+/// Internal to the crate -- callers configure idle timeout through
+/// [`AggregateStoreBuilder::idle_timeout`](crate::AggregateStoreBuilder::idle_timeout).
+pub(crate) struct ActorConfig {
+    /// How long the actor waits for a message before shutting down.
+    /// An effectively infinite value means the actor never idles out.
+    pub idle_timeout: Duration,
+}
 
 /// Result type sent back through the `Execute` reply channel.
 type ExecuteResult<A> =
@@ -59,9 +70,9 @@ pub(crate) enum ActorMessage<A: Aggregate> {
 ///
 /// Owns the `EventWriter` and aggregate state `View`. Receives messages
 /// from `AggregateHandle` via the mpsc channel and processes them sequentially.
-/// The loop exits when the channel closes (all senders dropped) or a
-/// `Shutdown` message is received. On exit the `EventWriter` is dropped,
-/// releasing the flock.
+/// The loop exits when the channel closes (all senders dropped), a
+/// `Shutdown` message is received, or the idle timeout elapses. On exit the
+/// `EventWriter` is dropped, releasing the flock.
 ///
 /// # Arguments
 ///
@@ -69,33 +80,63 @@ pub(crate) enum ActorMessage<A: Aggregate> {
 /// * `view` - Derived view that holds the current aggregate state.
 /// * `reader` - Reader used to refresh the view before each operation.
 /// * `rx` - Receiving end of the mpsc channel carrying `ActorMessage`s.
+/// * `config` - Actor configuration (idle timeout).
 pub(crate) fn run_actor<A: Aggregate>(
     mut writer: EventWriter,
     mut view: View<A>,
     reader: EventReader,
     mut rx: mpsc::Receiver<ActorMessage<A>>,
+    config: ActorConfig,
 ) {
-    // `blocking_recv` blocks the current thread until a message arrives
-    // or the channel closes (all senders dropped). This is appropriate
-    // because this function runs inside `spawn_blocking`.
-    while let Some(msg) = rx.blocking_recv() {
+    // Build a lightweight current-thread runtime with time enabled.
+    // The actor needs `tokio::time::timeout` to implement idle eviction,
+    // but the parent runtime may be current-thread (common in tests),
+    // which doesn't drive timers from non-runtime threads. A dedicated
+    // minimal runtime avoids that constraint and keeps the actor
+    // self-contained.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("failed to create actor timeout runtime");
+
+    loop {
+        // Create the timeout future INSIDE `block_on` so that the `Sleep`
+        // timer registers with the local runtime's time driver.
+        let idle_timeout = config.idle_timeout;
+        let msg = rt.block_on(async { tokio::time::timeout(idle_timeout, rx.recv()).await });
+
         match msg {
-            ActorMessage::Execute { cmd, ctx, reply } => {
-                let result = execute_command::<A>(&mut writer, &mut view, &reader, cmd, &ctx);
-                // If the receiver was dropped, the caller no longer cares
-                // about the result. Silently discard it.
-                let _ = reply.send(result);
-            }
+            // Received a message before the timeout elapsed.
+            Ok(Some(msg)) => match msg {
+                ActorMessage::Execute { cmd, ctx, reply } => {
+                    let _span = tracing::info_span!("execute", aggregate_type = A::AGGREGATE_TYPE,)
+                        .entered();
+                    let result = execute_command::<A>(&mut writer, &mut view, &reader, cmd, &ctx);
+                    // If the receiver was dropped, the caller no longer cares
+                    // about the result. Silently discard it.
+                    let _ = reply.send(result);
+                }
 
-            ActorMessage::GetState { reply } => {
-                let result = get_state::<A>(&mut view, &reader);
-                let _ = reply.send(result);
-            }
+                ActorMessage::GetState { reply } => {
+                    let result = get_state::<A>(&mut view, &reader);
+                    let _ = reply.send(result);
+                }
 
-            ActorMessage::Shutdown => break,
+                ActorMessage::Shutdown => break,
+            },
+            // Channel closed: all senders dropped.
+            Ok(None) => break,
+            // Idle timeout elapsed with no messages.
+            Err(_elapsed) => {
+                tracing::info!(
+                    aggregate_type = A::AGGREGATE_TYPE,
+                    "actor idle, shutting down"
+                );
+                break;
+            }
         }
     }
-    // Loop exited: either `Shutdown` received or all senders dropped.
+    // Loop exited: either `Shutdown` received, channel closed, or idle timeout.
     // `writer` is dropped here, releasing the flock on the event log.
 }
 
@@ -129,6 +170,8 @@ fn execute_command<A: Aggregate>(
             .map_err(|e| ExecuteError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
         writer.append(&ef_event).map_err(ExecuteError::Io)?;
     }
+
+    tracing::info!(count = domain_events.len(), "events appended");
 
     Ok(domain_events)
 }
@@ -226,6 +269,53 @@ impl<A: Aggregate> AggregateHandle<A> {
     pub fn reader(&self) -> &EventReader {
         &self.reader
     }
+
+    /// Check whether the actor backing this handle is still running.
+    ///
+    /// Returns `false` if the actor thread has exited (e.g. due to idle
+    /// timeout or shutdown). The store uses this to evict stale handles
+    /// from its cache and re-spawn the actor on the next `get` call.
+    pub fn is_alive(&self) -> bool {
+        !self.sender.is_closed()
+    }
+}
+
+/// Spawn a new aggregate actor with explicit configuration.
+///
+/// This is the internal entry point used by [`AggregateStore`](crate::AggregateStore)
+/// to pass an idle timeout to the actor loop.
+///
+/// # Arguments
+///
+/// * `stream_dir` - Path to the directory containing the event log.
+/// * `config` - Actor configuration (idle timeout).
+///
+/// # Returns
+///
+/// An [`AggregateHandle`] for sending commands and reading state.
+///
+/// # Errors
+///
+/// Returns [`std::io::Error`] if the event log cannot be opened.
+pub(crate) fn spawn_actor_with_config<A: Aggregate>(
+    stream_dir: &Path,
+    config: ActorConfig,
+) -> io::Result<AggregateHandle<A>> {
+    let writer = EventWriter::open(stream_dir)?;
+    let reader = writer.reader();
+    let views_dir = stream_dir.join("views");
+    let view = View::<A>::new("state", reducer::<A>(), &views_dir);
+    let (tx, rx) = mpsc::channel::<ActorMessage<A>>(32);
+    let handle_reader = reader.clone();
+
+    std::thread::spawn(move || {
+        run_actor::<A>(writer, view, reader, rx, config);
+    });
+
+    Ok(AggregateHandle {
+        sender: tx,
+        reader: handle_reader,
+    })
 }
 
 /// Spawn a new aggregate actor for the stream at `stream_dir`.
@@ -233,6 +323,10 @@ impl<A: Aggregate> AggregateHandle<A> {
 /// Opens the [`EventWriter`], creates an [`EventReader`] and aggregate
 /// state [`View`], then starts the actor loop on a dedicated blocking
 /// thread.
+///
+/// The actor created by this function uses an effectively infinite idle
+/// timeout. For configurable timeouts, use
+/// [`AggregateStoreBuilder::idle_timeout`](crate::AggregateStoreBuilder::idle_timeout).
 ///
 /// # Arguments
 ///
@@ -247,21 +341,13 @@ impl<A: Aggregate> AggregateHandle<A> {
 ///
 /// Returns [`std::io::Error`] if the event log cannot be opened.
 pub fn spawn_actor<A: Aggregate>(stream_dir: &Path) -> io::Result<AggregateHandle<A>> {
-    let writer = EventWriter::open(stream_dir)?;
-    let reader = writer.reader();
-    let views_dir = stream_dir.join("views");
-    let view = View::<A>::new("state", reducer::<A>(), &views_dir);
-    let (tx, rx) = mpsc::channel::<ActorMessage<A>>(32);
-    let handle_reader = reader.clone();
-
-    std::thread::spawn(move || {
-        run_actor::<A>(writer, view, reader, rx);
-    });
-
-    Ok(AggregateHandle {
-        sender: tx,
-        reader: handle_reader,
-    })
+    // Use an effectively infinite timeout so the actor never idles out.
+    // `u64::MAX / 2` avoids overflow when tokio adds the timeout duration
+    // to the current `Instant`.
+    let config = ActorConfig {
+        idle_timeout: Duration::from_secs(u64::MAX / 2),
+    };
+    spawn_actor_with_config(stream_dir, config)
 }
 
 #[cfg(test)]
@@ -369,5 +455,66 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(events, vec![CounterEvent::Incremented]);
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_shuts_down_actor() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let config = ActorConfig {
+            idle_timeout: Duration::from_millis(200),
+        };
+        let handle =
+            spawn_actor_with_config::<Counter>(tmp.path(), config).expect("spawn should succeed");
+
+        // Execute a command before the timeout.
+        handle
+            .execute(CounterCommand::Increment, CommandContext::default())
+            .await
+            .expect("first execute should succeed");
+
+        // Wait for idle timeout to elapse.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Actor should have shut down.
+        assert!(
+            !handle.is_alive(),
+            "actor should be dead after idle timeout"
+        );
+
+        // Re-spawn on the same directory recovers state from disk.
+        let config2 = ActorConfig {
+            idle_timeout: Duration::from_secs(u64::MAX / 2),
+        };
+        let handle2 = spawn_actor_with_config::<Counter>(tmp.path(), config2)
+            .expect("respawn should succeed");
+        let state = handle2.state().await.expect("state should succeed");
+        assert_eq!(state.value, 1, "state should reflect the first command");
+    }
+
+    #[tokio::test]
+    async fn rapid_commands_prevent_idle_eviction() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let config = ActorConfig {
+            idle_timeout: Duration::from_millis(300),
+        };
+        let handle =
+            spawn_actor_with_config::<Counter>(tmp.path(), config).expect("spawn should succeed");
+
+        let ctx = CommandContext::default();
+        // Send commands at 100ms intervals, each resetting the idle timer.
+        for _ in 0..5 {
+            handle
+                .execute(CounterCommand::Increment, ctx.clone())
+                .await
+                .expect("execute should succeed");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            handle.is_alive(),
+            "actor should still be alive during activity"
+        );
+        let state = handle.state().await.expect("state should succeed");
+        assert_eq!(state.value, 5);
     }
 }

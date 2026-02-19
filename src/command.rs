@@ -1,7 +1,16 @@
 //! Command envelope and dispatch types.
 
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::aggregate::Aggregate;
+use crate::error::DispatchError;
+use crate::store::AggregateStore;
 
 /// Cross-cutting metadata passed alongside a command.
 ///
@@ -104,6 +113,153 @@ pub struct CommandEnvelope {
     pub command: Value,
     /// Cross-cutting metadata forwarded to the command handler.
     pub context: CommandContext,
+}
+
+// --- CommandBus ---
+
+/// Internal trait for type-erased command routing.
+///
+/// Each registered aggregate type gets a `TypedCommandRoute<A>` that
+/// downcasts the `Box<dyn Any>` command to `A::Command` and dispatches
+/// it through the store.
+trait CommandRoute: Send + Sync {
+    /// Dispatch a type-erased command to the target aggregate instance.
+    fn dispatch<'a>(
+        &'a self,
+        store: &'a AggregateStore,
+        instance_id: &'a str,
+        cmd: Box<dyn Any + Send>,
+        ctx: CommandContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), DispatchError>> + Send + 'a>>;
+}
+
+/// Concrete command route for aggregate type `A`.
+///
+/// Downcasts the `Box<dyn Any>` to `A::Command`, looks up the aggregate
+/// handle via `store.get::<A>()`, and executes the command.
+struct TypedCommandRoute<A: Aggregate> {
+    _marker: std::marker::PhantomData<A>,
+}
+
+impl<A: Aggregate> CommandRoute for TypedCommandRoute<A> {
+    fn dispatch<'a>(
+        &'a self,
+        store: &'a AggregateStore,
+        instance_id: &'a str,
+        cmd: Box<dyn Any + Send>,
+        ctx: CommandContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), DispatchError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Downcast the type-erased command back to the concrete type.
+            // This cannot fail when the route was registered correctly via
+            // `register::<A>()` because the TypeId lookup guarantees we
+            // only arrive here for commands of type `A::Command`.
+            let typed_cmd = cmd
+                .downcast::<A::Command>()
+                .map_err(|_| DispatchError::UnknownCommand)?;
+
+            let handle = store
+                .get::<A>(instance_id)
+                .await
+                .map_err(DispatchError::Io)?;
+
+            handle
+                .execute(*typed_cmd, ctx)
+                .await
+                .map_err(|e| DispatchError::Execution(Box::new(e)))?;
+
+            Ok(())
+        })
+    }
+}
+
+/// Typed command router that maps concrete command types to aggregate handlers.
+///
+/// Unlike the [`CommandEnvelope`]-based dispatch used by process managers,
+/// `CommandBus` routes commands by their Rust `TypeId` at zero runtime cost
+/// (single `HashMap` lookup). Commands do **not** need to be serializable.
+///
+/// # Usage
+///
+/// ```no_run
+/// use eventfold_es::{AggregateStore, CommandBus, CommandContext};
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let store = AggregateStore::open("/tmp/my-app").await?;
+/// let mut bus = CommandBus::new(store);
+/// // bus.register::<MyAggregate>();
+/// // bus.dispatch("instance-1", MyCommand { .. }, CommandContext::default()).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct CommandBus {
+    store: AggregateStore,
+    routes: HashMap<TypeId, Box<dyn CommandRoute>>,
+}
+
+impl CommandBus {
+    /// Create a new `CommandBus` backed by the given store.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - The [`AggregateStore`] used to look up and spawn aggregate actors.
+    pub fn new(store: AggregateStore) -> Self {
+        Self {
+            store,
+            routes: HashMap::new(),
+        }
+    }
+
+    /// Register an aggregate type for command routing.
+    ///
+    /// After registration, commands of type `A::Command` can be dispatched
+    /// via [`dispatch`](CommandBus::dispatch). The route is keyed by
+    /// `TypeId::of::<A::Command>()`.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `A` - An aggregate whose `Command` type will be routed.
+    pub fn register<A: Aggregate>(&mut self) {
+        let type_id = TypeId::of::<A::Command>();
+        self.routes.insert(
+            type_id,
+            Box::new(TypedCommandRoute::<A> {
+                _marker: std::marker::PhantomData,
+            }),
+        );
+    }
+
+    /// Dispatch a command to the appropriate aggregate instance.
+    ///
+    /// Looks up the route by `TypeId::of::<C>()` and delegates to the
+    /// registered aggregate's actor.
+    ///
+    /// # Arguments
+    ///
+    /// * `instance_id` - The target aggregate instance identifier.
+    /// * `cmd` - The concrete command to dispatch.
+    /// * `ctx` - Cross-cutting metadata (actor, correlation ID, etc.).
+    ///
+    /// # Errors
+    ///
+    /// * [`DispatchError::UnknownCommand`] -- no aggregate registered for `C`.
+    /// * [`DispatchError::Io`] -- actor spawning or I/O failure.
+    /// * [`DispatchError::Execution`] -- the aggregate rejected the command.
+    pub async fn dispatch<C: Send + 'static>(
+        &self,
+        instance_id: &str,
+        cmd: C,
+        ctx: CommandContext,
+    ) -> Result<(), DispatchError> {
+        let type_id = TypeId::of::<C>();
+        let route = self
+            .routes
+            .get(&type_id)
+            .ok_or(DispatchError::UnknownCommand)?;
+        route
+            .dispatch(&self.store, instance_id, Box::new(cmd), ctx)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -213,5 +369,112 @@ mod tests {
         assert_eq!(deserialized.instance_id, envelope.instance_id);
         assert_eq!(deserialized.command, envelope.command);
         assert_eq!(deserialized.context.actor, envelope.context.actor);
+    }
+
+    // --- CommandBus tests ---
+
+    use tempfile::TempDir;
+
+    use crate::aggregate::test_fixtures::{Counter, CounterCommand};
+    use crate::error::DispatchError;
+    use crate::store::AggregateStore;
+
+    // A second aggregate type for testing multi-type dispatch.
+    #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Toggle {
+        pub on: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "type", content = "data")]
+    enum ToggleEvent {
+        Toggled,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum ToggleError {}
+
+    /// Command type for Toggle -- a unit struct to avoid TypeId collision
+    /// with the `()` unit type.
+    struct ToggleCmd;
+
+    impl crate::aggregate::Aggregate for Toggle {
+        const AGGREGATE_TYPE: &'static str = "toggle";
+        type Command = ToggleCmd;
+        type DomainEvent = ToggleEvent;
+        type Error = ToggleError;
+
+        fn handle(&self, _cmd: ToggleCmd) -> Result<Vec<ToggleEvent>, ToggleError> {
+            Ok(vec![ToggleEvent::Toggled])
+        }
+
+        fn apply(mut self, _event: &ToggleEvent) -> Self {
+            self.on = !self.on;
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn command_bus_dispatch_to_two_aggregate_types() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        let mut bus = CommandBus::new(store.clone());
+        bus.register::<Counter>();
+        bus.register::<Toggle>();
+
+        // Dispatch to Counter.
+        bus.dispatch("c-1", CounterCommand::Increment, CommandContext::default())
+            .await
+            .expect("counter dispatch should succeed");
+        bus.dispatch("c-1", CounterCommand::Increment, CommandContext::default())
+            .await
+            .expect("second counter dispatch should succeed");
+
+        // Dispatch to Toggle.
+        bus.dispatch("t-1", ToggleCmd, CommandContext::default())
+            .await
+            .expect("toggle dispatch should succeed");
+
+        // Verify state through the store.
+        let counter_state = store
+            .get::<Counter>("c-1")
+            .await
+            .expect("get counter should succeed")
+            .state()
+            .await
+            .expect("counter state should succeed");
+        assert_eq!(counter_state.value, 2);
+
+        let toggle_state = store
+            .get::<Toggle>("t-1")
+            .await
+            .expect("get toggle should succeed")
+            .state()
+            .await
+            .expect("toggle state should succeed");
+        assert!(toggle_state.on);
+    }
+
+    #[tokio::test]
+    async fn command_bus_unknown_command_returns_error() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        let bus = CommandBus::new(store);
+        // No types registered.
+
+        let result = bus
+            .dispatch("c-1", CounterCommand::Increment, CommandContext::default())
+            .await;
+
+        assert!(
+            matches!(result, Err(DispatchError::UnknownCommand)),
+            "expected UnknownCommand, got: {result:?}"
+        );
     }
 }
