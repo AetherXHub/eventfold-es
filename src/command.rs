@@ -1,5 +1,6 @@
 //! Command envelope and dispatch types.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Cross-cutting metadata passed alongside a command.
@@ -23,7 +24,7 @@ use serde_json::Value;
 /// assert_eq!(ctx.correlation_id.as_deref(), Some("req-abc-123"));
 /// assert!(ctx.metadata.is_some());
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommandContext {
     /// Identity of the actor issuing the command (e.g. a user ID).
     pub actor: Option<String>,
@@ -78,6 +79,31 @@ impl CommandContext {
         self.metadata = Some(meta);
         self
     }
+}
+
+/// A type-erased command envelope for cross-aggregate dispatch.
+///
+/// Produced by process managers when reacting to events. The `command` field
+/// is a `serde_json::Value` because the process manager does not know the
+/// concrete command type of the target aggregate at compile time. The
+/// dispatch layer deserializes it into the correct `A::Command` at runtime.
+///
+/// # Fields
+///
+/// * `aggregate_type` - Target aggregate type name (must match `Aggregate::AGGREGATE_TYPE`).
+/// * `instance_id` - Target aggregate instance identifier.
+/// * `command` - JSON-serialized command payload.
+/// * `context` - Cross-cutting metadata forwarded to the command handler.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandEnvelope {
+    /// Target aggregate type name (must match `Aggregate::AGGREGATE_TYPE`).
+    pub aggregate_type: String,
+    /// Target aggregate instance identifier.
+    pub instance_id: String,
+    /// JSON-serialized command payload.
+    pub command: Value,
+    /// Cross-cutting metadata forwarded to the command handler.
+    pub context: CommandContext,
 }
 
 #[cfg(test)]
@@ -152,5 +178,40 @@ mod tests {
         let ctx = CommandContext::default().with_actor("dbg-user");
         let debug_output = format!("{ctx:?}");
         assert!(debug_output.contains("dbg-user"));
+    }
+
+    #[test]
+    fn command_context_serde_roundtrip() {
+        let ctx = CommandContext::default()
+            .with_actor("user-1")
+            .with_correlation_id("corr-1")
+            .with_metadata(json!({"key": "value"}));
+
+        let json = serde_json::to_string(&ctx).expect("serialization should succeed");
+        let deserialized: CommandContext =
+            serde_json::from_str(&json).expect("deserialization should succeed");
+
+        assert_eq!(deserialized.actor, ctx.actor);
+        assert_eq!(deserialized.correlation_id, ctx.correlation_id);
+        assert_eq!(deserialized.metadata, ctx.metadata);
+    }
+
+    #[test]
+    fn command_envelope_serde_roundtrip() {
+        let envelope = CommandEnvelope {
+            aggregate_type: "counter".to_string(),
+            instance_id: "c-1".to_string(),
+            command: json!({"type": "Increment"}),
+            context: CommandContext::default().with_actor("saga"),
+        };
+
+        let json = serde_json::to_string(&envelope).expect("serialization should succeed");
+        let deserialized: CommandEnvelope =
+            serde_json::from_str(&json).expect("deserialization should succeed");
+
+        assert_eq!(deserialized.aggregate_type, envelope.aggregate_type);
+        assert_eq!(deserialized.instance_id, envelope.instance_id);
+        assert_eq!(deserialized.command, envelope.command);
+        assert_eq!(deserialized.context.actor, envelope.context.actor);
     }
 }

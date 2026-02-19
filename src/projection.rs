@@ -37,7 +37,6 @@ pub trait Projection:
 }
 
 /// Tracks the read position within a single event stream.
-#[allow(dead_code)] // Used by ProjectionRunner; consumed externally in Task #15.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CursorPosition {
     /// Byte offset past the last consumed event.
@@ -52,7 +51,6 @@ pub(crate) struct CursorPosition {
 /// allowing the projection to track independent read positions across
 /// multiple aggregate streams. A custom serde module encodes each tuple
 /// key as `"aggregate_type/instance_id"` so the map serializes to valid JSON.
-#[allow(dead_code)] // Used by ProjectionRunner; consumed externally in Task #15.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ProjectionCheckpoint<P> {
     /// The projection's current state.
@@ -68,7 +66,6 @@ pub(crate) struct ProjectionCheckpoint<P> {
 /// instance_id)` tuple as `"aggregate_type/instance_id"`. The separator
 /// `/` is safe because aggregate types and instance IDs are path-safe
 /// identifiers that never contain `/`.
-#[allow(dead_code)] // Used by ProjectionCheckpoint serde; consumed externally in Task #15.
 mod cursor_map {
     use super::*;
     use serde::ser::SerializeMap;
@@ -133,7 +130,6 @@ impl<P: Default> Default for ProjectionCheckpoint<P> {
 /// # Errors
 ///
 /// Returns `io::Error` if directory creation, file writing, or renaming fails.
-#[allow(dead_code)] // Used by ProjectionRunner; consumed externally in Task #15.
 pub(crate) fn save_checkpoint<P: Projection>(
     dir: &Path,
     checkpoint: &ProjectionCheckpoint<P>,
@@ -159,7 +155,6 @@ pub(crate) fn save_checkpoint<P: Projection>(
 /// # Errors
 ///
 /// Returns `io::Error` for I/O failures other than file-not-found.
-#[allow(dead_code)] // Used by ProjectionRunner; consumed externally in Task #15.
 pub(crate) fn load_checkpoint<P: Projection>(
     dir: &Path,
 ) -> io::Result<Option<ProjectionCheckpoint<P>>> {
@@ -190,7 +185,7 @@ pub(crate) fn load_checkpoint<P: Projection>(
 /// # Errors
 ///
 /// Returns `io::Error` for I/O failures other than file-not-found.
-#[allow(dead_code)] // Used by ProjectionRunner; consumed externally in Task #15.
+#[allow(dead_code)] // Used by ProjectionRunner::rebuild, which is test-only.
 pub(crate) fn delete_checkpoint(dir: &Path) -> io::Result<()> {
     let path = dir.join("checkpoint.json");
     match std::fs::remove_file(&path) {
@@ -205,7 +200,6 @@ pub(crate) fn delete_checkpoint(dir: &Path) -> io::Result<()> {
 /// Manages the lifecycle of a single [`Projection`]: loading its persisted
 /// checkpoint, catching up on new events from all subscribed aggregate
 /// streams, and saving the checkpoint back to disk.
-#[allow(dead_code)] // Consumed externally in Task #15.
 pub(crate) struct ProjectionRunner<P: Projection> {
     /// The projection's persisted state and per-stream cursor positions.
     checkpoint: ProjectionCheckpoint<P>,
@@ -215,7 +209,6 @@ pub(crate) struct ProjectionRunner<P: Projection> {
     checkpoint_dir: PathBuf,
 }
 
-#[allow(dead_code)] // Consumed externally in Task #15.
 impl<P: Projection> ProjectionRunner<P> {
     /// Create a new runner, loading an existing checkpoint from disk if available.
     ///
@@ -304,6 +297,7 @@ impl<P: Projection> ProjectionRunner<P> {
     /// # Errors
     ///
     /// Returns `io::Error` if deleting the checkpoint or catching up fails.
+    #[allow(dead_code)] // Used in integration tests.
     pub(crate) fn rebuild(&mut self) -> io::Result<()> {
         delete_checkpoint(&self.checkpoint_dir)?;
         self.checkpoint = ProjectionCheckpoint::default();

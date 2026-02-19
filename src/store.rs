@@ -11,6 +11,10 @@ use tokio::sync::RwLock;
 
 use crate::actor::{AggregateHandle, spawn_actor};
 use crate::aggregate::Aggregate;
+use crate::process_manager::{
+    AggregateDispatcher, ProcessManagerCatchUp, ProcessManagerReport, ProcessManagerRunner,
+    TypedDispatcher, append_dead_letter,
+};
 use crate::projection::{Projection, ProjectionRunner};
 use crate::storage::StreamLayout;
 
@@ -27,6 +31,15 @@ type HandleCache = HashMap<(String, String), Box<dyn Any + Send + Sync>>;
 /// held briefly and `catch_up` does blocking I/O that should not hold an async
 /// mutex across an `.await` point.
 type ProjectionMap = HashMap<String, Box<dyn Any + Send + Sync>>;
+
+/// Type-erased list of process manager runners.
+///
+/// Each runner is wrapped in `std::sync::Mutex` because `catch_up` does
+/// blocking file I/O that must not hold an async mutex.
+type ProcessManagerList = Vec<std::sync::Mutex<Box<dyn ProcessManagerCatchUp>>>;
+
+/// Type-erased dispatcher map keyed by aggregate type name.
+type DispatcherMap = HashMap<String, Box<dyn AggregateDispatcher>>;
 
 /// Central registry that manages aggregate instance lifecycles.
 ///
@@ -49,6 +62,8 @@ pub struct AggregateStore {
     layout: StreamLayout,
     cache: Arc<RwLock<HandleCache>>,
     projections: Arc<std::sync::RwLock<ProjectionMap>>,
+    process_managers: Arc<std::sync::RwLock<ProcessManagerList>>,
+    dispatchers: Arc<DispatcherMap>,
 }
 
 // Manual `Debug` because `dyn Any` is not `Debug` and we don't want to
@@ -89,6 +104,8 @@ impl AggregateStore {
             layout,
             cache: Arc::new(RwLock::new(HashMap::new())),
             projections: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            process_managers: Arc::new(std::sync::RwLock::new(Vec::new())),
+            dispatchers: Arc::new(HashMap::new()),
         })
     }
 
@@ -183,6 +200,8 @@ impl AggregateStore {
         AggregateStoreBuilder {
             base_dir: base_dir.as_ref().to_owned(),
             projection_factories: Vec::new(),
+            process_manager_factories: Vec::new(),
+            dispatcher_factories: Vec::new(),
         }
     }
 
@@ -228,6 +247,92 @@ impl AggregateStore {
         Ok(runner.state().clone())
     }
 
+    /// Run all registered process managers through a catch-up pass.
+    ///
+    /// For each process manager:
+    /// 1. Catch up on subscribed streams, collecting command envelopes.
+    /// 2. Dispatch each envelope to the target aggregate via the type registry.
+    /// 3. Write failed dispatches to the per-PM dead-letter log.
+    /// 4. Save the process manager checkpoint after all envelopes are handled.
+    ///
+    /// # Returns
+    ///
+    /// A [`ProcessManagerReport`] summarizing how many envelopes were
+    /// dispatched and how many were dead-lettered.
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::Error` if catching up or saving checkpoints fails.
+    pub async fn run_process_managers(&self) -> io::Result<ProcessManagerReport> {
+        // Collect envelopes and dead-letter paths from each PM under the
+        // std::sync::Mutex. The lock is held only for catch_up (blocking I/O).
+        let mut all_work: Vec<(Vec<crate::command::CommandEnvelope>, std::path::PathBuf)> =
+            Vec::new();
+
+        {
+            let pms = self
+                .process_managers
+                .read()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            for pm_mutex in pms.iter() {
+                let mut pm = pm_mutex
+                    .lock()
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let envelopes = pm.catch_up()?;
+                let dead_letter_path = pm.dead_letter_path();
+                all_work.push((envelopes, dead_letter_path));
+            }
+        }
+
+        // Dispatch envelopes asynchronously.
+        let mut report = ProcessManagerReport::default();
+        for (envelopes, dead_letter_path) in &all_work {
+            for envelope in envelopes {
+                let agg_type = &envelope.aggregate_type;
+                match self.dispatchers.get(agg_type) {
+                    Some(dispatcher) => match dispatcher.dispatch(self, envelope.clone()).await {
+                        Ok(()) => report.dispatched += 1,
+                        Err(e) => {
+                            tracing::error!(
+                                aggregate_type = %agg_type,
+                                instance_id = %envelope.instance_id,
+                                error = %e,
+                                "process manager dispatch failed, dead-lettering"
+                            );
+                            append_dead_letter(dead_letter_path, envelope.clone(), &e.to_string())?;
+                            report.dead_lettered += 1;
+                        }
+                    },
+                    None => {
+                        let err_msg = format!("unknown aggregate type: {agg_type}");
+                        tracing::error!(
+                            aggregate_type = %agg_type,
+                            "no dispatcher registered, dead-lettering"
+                        );
+                        append_dead_letter(dead_letter_path, envelope.clone(), &err_msg)?;
+                        report.dead_lettered += 1;
+                    }
+                }
+            }
+        }
+
+        // Save all PM checkpoints after dispatch is complete.
+        {
+            let pms = self
+                .process_managers
+                .read()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            for pm_mutex in pms.iter() {
+                let pm = pm_mutex
+                    .lock()
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                pm.save()?;
+            }
+        }
+
+        Ok(report)
+    }
+
     /// Returns a reference to the underlying storage layout.
     pub fn layout(&self) -> &StreamLayout {
         &self.layout
@@ -241,11 +346,21 @@ impl AggregateStore {
 /// as `Box<dyn Any + Send + Sync>` for storage in the projection map.
 type ProjectionFactory = Box<dyn FnOnce(StreamLayout) -> io::Result<Box<dyn Any + Send + Sync>>>;
 
-/// Builder for configuring an [`AggregateStore`] with projections.
+/// Factory function type for creating a type-erased process manager runner.
+type ProcessManagerFactory =
+    Box<dyn FnOnce(StreamLayout) -> io::Result<std::sync::Mutex<Box<dyn ProcessManagerCatchUp>>>>;
+
+/// Factory function type for creating a type-erased aggregate dispatcher.
+type DispatcherFactory = Box<dyn FnOnce() -> Box<dyn AggregateDispatcher>>;
+
+/// Builder for configuring an [`AggregateStore`] with projections and
+/// process managers.
 ///
 /// Created via [`AggregateStore::builder`]. Register projections with
-/// [`projection`](AggregateStoreBuilder::projection), then call
-/// [`open`](AggregateStoreBuilder::open) to finalize.
+/// [`projection`](AggregateStoreBuilder::projection), process managers with
+/// [`process_manager`](AggregateStoreBuilder::process_manager), and dispatch
+/// targets with [`aggregate_type`](AggregateStoreBuilder::aggregate_type),
+/// then call [`open`](AggregateStoreBuilder::open) to finalize.
 ///
 /// # Examples
 ///
@@ -255,6 +370,8 @@ type ProjectionFactory = Box<dyn FnOnce(StreamLayout) -> io::Result<Box<dyn Any 
 /// # async fn example() -> std::io::Result<()> {
 /// let store = AggregateStore::builder("/tmp/my-app")
 ///     // .projection::<MyProjection>()
+///     // .process_manager::<MySaga>()
+///     // .aggregate_type::<MyAggregate>()
 ///     .open()
 ///     .await?;
 /// # Ok(())
@@ -263,6 +380,8 @@ type ProjectionFactory = Box<dyn FnOnce(StreamLayout) -> io::Result<Box<dyn Any 
 pub struct AggregateStoreBuilder {
     base_dir: PathBuf,
     projection_factories: Vec<(String, ProjectionFactory)>,
+    process_manager_factories: Vec<(String, ProcessManagerFactory)>,
+    dispatcher_factories: Vec<(String, DispatcherFactory)>,
 }
 
 impl AggregateStoreBuilder {
@@ -289,10 +408,67 @@ impl AggregateStoreBuilder {
         self
     }
 
-    /// Build and open the store, initializing all registered projections.
+    /// Register a process manager type to be managed by this store.
+    ///
+    /// The process manager will be initialized (loading any existing
+    /// checkpoint) when [`open`](AggregateStoreBuilder::open) is called.
+    /// Use [`run_process_managers`](AggregateStore::run_process_managers)
+    /// to trigger catch-up and dispatch.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `PM` - A type implementing [`ProcessManager`](crate::process_manager::ProcessManager).
+    ///
+    /// # Returns
+    ///
+    /// `self` for method chaining.
+    pub fn process_manager<PM>(mut self) -> Self
+    where
+        PM: crate::process_manager::ProcessManager,
+    {
+        self.process_manager_factories.push((
+            PM::NAME.to_owned(),
+            Box::new(|layout| {
+                let runner = ProcessManagerRunner::<PM>::new(layout)?;
+                Ok(std::sync::Mutex::new(
+                    Box::new(runner) as Box<dyn ProcessManagerCatchUp>
+                ))
+            }),
+        ));
+        self
+    }
+
+    /// Register an aggregate type as a dispatch target for process managers.
+    ///
+    /// This allows [`CommandEnvelope`](crate::command::CommandEnvelope)s
+    /// targeting this aggregate type to be deserialized and routed. The
+    /// aggregate's `Command` type must implement `DeserializeOwned`.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `A` - A type implementing [`Aggregate`] with `Command: DeserializeOwned`.
+    ///
+    /// # Returns
+    ///
+    /// `self` for method chaining.
+    pub fn aggregate_type<A>(mut self) -> Self
+    where
+        A: Aggregate,
+        A::Command: serde::de::DeserializeOwned,
+    {
+        self.dispatcher_factories.push((
+            A::AGGREGATE_TYPE.to_owned(),
+            Box::new(|| Box::new(TypedDispatcher::<A>::new()) as Box<dyn AggregateDispatcher>),
+        ));
+        self
+    }
+
+    /// Build and open the store, initializing all registered projections
+    /// and process managers.
     ///
     /// Creates the metadata directory on disk and instantiates each
-    /// projection runner (loading persisted checkpoints if available).
+    /// projection runner and process manager runner (loading persisted
+    /// checkpoints if available).
     ///
     /// # Returns
     ///
@@ -300,7 +476,7 @@ impl AggregateStoreBuilder {
     ///
     /// # Errors
     ///
-    /// Returns `io::Error` if directory creation or projection initialization fails.
+    /// Returns `io::Error` if directory creation or initialization fails.
     pub async fn open(self) -> io::Result<AggregateStore> {
         let layout = StreamLayout::new(&self.base_dir);
         let meta_dir = layout.meta_dir();
@@ -314,10 +490,23 @@ impl AggregateStoreBuilder {
             projections.insert(name, runner);
         }
 
+        let mut process_managers = Vec::new();
+        for (_name, factory) in self.process_manager_factories {
+            let runner = factory(layout.clone())?;
+            process_managers.push(runner);
+        }
+
+        let mut dispatchers: HashMap<String, Box<dyn AggregateDispatcher>> = HashMap::new();
+        for (name, factory) in self.dispatcher_factories {
+            dispatchers.insert(name, factory());
+        }
+
         Ok(AggregateStore {
             layout,
             cache: Arc::new(RwLock::new(HashMap::new())),
             projections: Arc::new(std::sync::RwLock::new(projections)),
+            process_managers: Arc::new(std::sync::RwLock::new(process_managers)),
+            dispatchers: Arc::new(dispatchers),
         })
     }
 }
@@ -672,5 +861,251 @@ mod tests {
 
         let state = handle.state().await.expect("state should succeed");
         assert_eq!(state.value, 1);
+    }
+
+    // --- Process manager integration tests ---
+    //
+    // These tests use a "Receiver" aggregate that accepts deserializable
+    // commands, plus a "ForwardSaga" process manager that reacts to Counter
+    // events and dispatches commands to the Receiver.
+
+    /// A minimal aggregate that accepts JSON-deserializable commands.
+    /// Used as a dispatch target for process manager tests.
+    #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Receiver {
+        pub received_count: u64,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "type", content = "data")]
+    enum ReceiverCommand {
+        Accept,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "type", content = "data")]
+    enum ReceiverEvent {
+        Accepted,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum ReceiverError {}
+
+    impl Aggregate for Receiver {
+        const AGGREGATE_TYPE: &'static str = "receiver";
+        type Command = ReceiverCommand;
+        type DomainEvent = ReceiverEvent;
+        type Error = ReceiverError;
+
+        fn handle(&self, _cmd: ReceiverCommand) -> Result<Vec<ReceiverEvent>, ReceiverError> {
+            Ok(vec![ReceiverEvent::Accepted])
+        }
+
+        fn apply(mut self, _event: &ReceiverEvent) -> Self {
+            self.received_count += 1;
+            self
+        }
+    }
+
+    /// A process manager that reacts to counter events by dispatching
+    /// `Accept` commands to the Receiver aggregate.
+    #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct ForwardSaga {
+        pub forwarded: u64,
+    }
+
+    impl crate::process_manager::ProcessManager for ForwardSaga {
+        const NAME: &'static str = "forward-saga";
+
+        fn subscriptions(&self) -> &'static [&'static str] {
+            &["counter"]
+        }
+
+        fn react(
+            &mut self,
+            _aggregate_type: &str,
+            stream_id: &str,
+            _event: &eventfold::Event,
+        ) -> Vec<crate::command::CommandEnvelope> {
+            self.forwarded += 1;
+            vec![crate::command::CommandEnvelope {
+                aggregate_type: "receiver".to_string(),
+                instance_id: stream_id.to_string(),
+                command: serde_json::json!({"type": "Accept"}),
+                context: CommandContext::default(),
+            }]
+        }
+    }
+
+    #[tokio::test]
+    async fn end_to_end_process_manager_dispatch() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::builder(tmp.path())
+            .process_manager::<ForwardSaga>()
+            .aggregate_type::<Receiver>()
+            .open()
+            .await
+            .expect("builder open should succeed");
+
+        // Produce events in the Counter aggregate.
+        increment(&store, "c-1").await;
+        increment(&store, "c-1").await;
+
+        // Run process managers: should catch up, dispatch to Receiver.
+        let report = store
+            .run_process_managers()
+            .await
+            .expect("run_process_managers should succeed");
+
+        assert_eq!(report.dispatched, 2);
+        assert_eq!(report.dead_lettered, 0);
+
+        // Verify the Receiver aggregate received the dispatched commands.
+        let receiver_handle = store
+            .get::<Receiver>("c-1")
+            .await
+            .expect("get receiver should succeed");
+        let receiver_state = receiver_handle
+            .state()
+            .await
+            .expect("receiver state should succeed");
+        assert_eq!(receiver_state.received_count, 2);
+    }
+
+    #[tokio::test]
+    async fn process_manager_dead_letters_unknown_type() {
+        /// A process manager that emits commands to a non-existent aggregate.
+        #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct BadTargetSaga {
+            seen: u64,
+        }
+
+        impl crate::process_manager::ProcessManager for BadTargetSaga {
+            const NAME: &'static str = "bad-target-saga";
+
+            fn subscriptions(&self) -> &'static [&'static str] {
+                &["counter"]
+            }
+
+            fn react(
+                &mut self,
+                _aggregate_type: &str,
+                _stream_id: &str,
+                _event: &eventfold::Event,
+            ) -> Vec<crate::command::CommandEnvelope> {
+                self.seen += 1;
+                vec![crate::command::CommandEnvelope {
+                    aggregate_type: "nonexistent".to_string(),
+                    instance_id: "x".to_string(),
+                    command: serde_json::json!({}),
+                    context: CommandContext::default(),
+                }]
+            }
+        }
+
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::builder(tmp.path())
+            .process_manager::<BadTargetSaga>()
+            .open()
+            .await
+            .expect("builder open should succeed");
+
+        increment(&store, "c-1").await;
+
+        let report = store
+            .run_process_managers()
+            .await
+            .expect("run_process_managers should succeed");
+
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.dead_lettered, 1);
+
+        // Verify dead-letter file is readable JSONL.
+        let dl_path = tmp
+            .path()
+            .join("process_managers/bad-target-saga/dead_letters.jsonl");
+        let contents = std::fs::read_to_string(&dl_path).expect("dead-letter file should exist");
+        let entry: serde_json::Value =
+            serde_json::from_str(contents.trim()).expect("dead-letter entry should be valid JSON");
+        assert!(
+            entry["error"]
+                .as_str()
+                .expect("error field should be a string")
+                .contains("nonexistent")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_process_managers_idempotent() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::builder(tmp.path())
+            .process_manager::<ForwardSaga>()
+            .aggregate_type::<Receiver>()
+            .open()
+            .await
+            .expect("builder open should succeed");
+
+        increment(&store, "c-1").await;
+
+        // First run: dispatches 1 envelope.
+        let first = store
+            .run_process_managers()
+            .await
+            .expect("first run should succeed");
+        assert_eq!(first.dispatched, 1);
+
+        // Second run with no new events: should be a no-op.
+        let second = store
+            .run_process_managers()
+            .await
+            .expect("second run should succeed");
+        assert_eq!(second.dispatched, 0);
+        assert_eq!(second.dead_lettered, 0);
+    }
+
+    #[tokio::test]
+    async fn process_manager_recovers_after_restart() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+
+        // First store: process 2 events.
+        {
+            let store = AggregateStore::builder(tmp.path())
+                .process_manager::<ForwardSaga>()
+                .aggregate_type::<Receiver>()
+                .open()
+                .await
+                .expect("builder open should succeed");
+
+            increment(&store, "c-1").await;
+            increment(&store, "c-2").await;
+
+            let report = store
+                .run_process_managers()
+                .await
+                .expect("run should succeed");
+            assert_eq!(report.dispatched, 2);
+        }
+
+        // Brief sleep so actor threads exit.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Second store: add 1 more event, run PM again.
+        let store = AggregateStore::builder(tmp.path())
+            .process_manager::<ForwardSaga>()
+            .aggregate_type::<Receiver>()
+            .open()
+            .await
+            .expect("reopen should succeed");
+
+        increment(&store, "c-1").await;
+
+        let report = store
+            .run_process_managers()
+            .await
+            .expect("run after restart should succeed");
+
+        // Should only dispatch the 1 new event, not replay old ones.
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(report.dead_lettered, 0);
     }
 }

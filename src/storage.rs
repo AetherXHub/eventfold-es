@@ -87,6 +87,15 @@ impl StreamLayout {
         self.base_dir.join("projections")
     }
 
+    /// Returns the path to the process managers directory.
+    ///
+    /// # Returns
+    ///
+    /// `<base_dir>/process_managers`
+    pub fn process_managers_dir(&self) -> PathBuf {
+        self.base_dir.join("process_managers")
+    }
+
     /// Returns the path to the metadata directory.
     ///
     /// # Returns
@@ -242,6 +251,11 @@ mod tests {
         );
 
         assert_eq!(layout.projections_dir(), tmp.path().join("projections"));
+
+        assert_eq!(
+            layout.process_managers_dir(),
+            tmp.path().join("process_managers")
+        );
 
         assert_eq!(layout.meta_dir(), tmp.path().join("meta"));
     }
