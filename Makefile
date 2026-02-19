@@ -1,20 +1,18 @@
 # eventfold-es -- unified check / format / lint / test targets
 #
 # Usage:
-#   make check      Run all checks (formatting, linting, types, tests)
-#   make fmt        Auto-fix formatting (Rust + TypeScript/React)
-#   make lint       Run linters (clippy + ESLint)
+#   make check      Run all checks (formatting, linting, tests)
+#   make fmt        Auto-fix formatting
+#   make lint       Run linters (clippy)
 #   make test       Run all tests
 
-.PHONY: check fmt fmt-check lint test build
-
-CRM_DIR := examples/crm
+.PHONY: check fmt fmt-check lint test
 
 # ---------------------------------------------------------------------------
 # Aggregate targets
 # ---------------------------------------------------------------------------
 
-check: fmt-check lint build test
+check: fmt-check lint test
 	@echo "All checks passed."
 
 # ---------------------------------------------------------------------------
@@ -23,20 +21,16 @@ check: fmt-check lint build test
 
 fmt:
 	cargo fmt
-	cd $(CRM_DIR) && npx prettier --write 'src-frontend/src/**/*.{ts,tsx,css}'
 
 fmt-check:
 	cargo fmt --check
-	cd $(CRM_DIR) && npx prettier --check 'src-frontend/src/**/*.{ts,tsx,css}'
 
 # ---------------------------------------------------------------------------
-# Linting + type checking
+# Linting
 # ---------------------------------------------------------------------------
 
 lint:
 	cargo clippy -- -D warnings
-	cd $(CRM_DIR) && npx tsc --noEmit
-	cd $(CRM_DIR) && npx eslint src-frontend/src/
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -44,10 +38,3 @@ lint:
 
 test:
 	cargo test
-
-# ---------------------------------------------------------------------------
-# Frontend build (Vite production build)
-# ---------------------------------------------------------------------------
-
-build:
-	cd $(CRM_DIR) && npm run build

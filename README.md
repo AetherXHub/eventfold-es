@@ -71,6 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 See [`examples/counter.rs`](examples/counter.rs) for a full example with projections and multiple instances.
 
+For a real-world example, see [eventfold-crm](https://github.com/AetherXHub/eventfold-crm) -- a Tauri v2 desktop CRM built on eventfold-es with aggregates, projections, process managers, and a React frontend.
+
 ## Core Types
 
 | Type | Role |
