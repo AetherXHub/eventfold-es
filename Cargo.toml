@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "examples/crm"]
+resolver = "2"
+
 [package]
 name = "eventfold-es"
 version = "0.1.0"
