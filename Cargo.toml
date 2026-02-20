@@ -1,13 +1,9 @@
-[workspace]
-members = ["."]
-resolver = "2"
-
 [package]
 name = "eventfold-es"
 version = "0.1.0"
 edition = "2024"
 description = "Embedded event-sourcing framework built on eventfold"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/aetherxhub/eventfold-es"
 readme = "README.md"
 keywords = ["event-sourcing", "cqrs", "aggregate", "eventfold", "embedded"]
