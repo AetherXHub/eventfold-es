@@ -66,7 +66,6 @@ pub(crate) enum ActorMessage<A: Aggregate> {
     /// The actor appends the event via its owned `EventWriter` and sends
     /// the I/O result back on `reply`. This keeps the actor as the sole
     /// writer for any stream that has a live actor.
-    #[allow(dead_code)]
     Inject {
         /// The pre-validated event to append as-is.
         event: eventfold::Event,
@@ -75,7 +74,7 @@ pub(crate) enum ActorMessage<A: Aggregate> {
     },
 
     /// Gracefully shut down the actor loop.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Constructed only in tests.
     Shutdown,
 }
 
@@ -298,7 +297,6 @@ impl<A: Aggregate> AggregateHandle<A> {
     /// * [`io::Error`] with [`io::ErrorKind::BrokenPipe`] if the actor
     ///   has exited and the channel is closed.
     /// * [`io::Error`] if the underlying `EventWriter::append` fails.
-    #[allow(dead_code)]
     pub(crate) async fn inject_via_actor(&self, event: eventfold::Event) -> io::Result<()> {
         let (tx, rx) = oneshot::channel();
         self.sender
