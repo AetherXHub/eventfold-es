@@ -61,6 +61,19 @@ pub(crate) enum ActorMessage<A: Aggregate> {
         reply: oneshot::Sender<Result<A, StateError>>,
     },
 
+    /// Inject a pre-validated `eventfold::Event` directly into the stream.
+    ///
+    /// The actor appends the event via its owned `EventWriter` and sends
+    /// the I/O result back on `reply`. This keeps the actor as the sole
+    /// writer for any stream that has a live actor.
+    #[allow(dead_code)]
+    Inject {
+        /// The pre-validated event to append as-is.
+        event: eventfold::Event,
+        /// Channel to send back the I/O result.
+        reply: oneshot::Sender<io::Result<()>>,
+    },
+
     /// Gracefully shut down the actor loop.
     #[allow(dead_code)]
     Shutdown,
@@ -119,6 +132,11 @@ pub(crate) fn run_actor<A: Aggregate>(
 
                 ActorMessage::GetState { reply } => {
                     let result = get_state::<A>(&mut view, &reader);
+                    let _ = reply.send(result);
+                }
+
+                ActorMessage::Inject { event, reply } => {
+                    let result = writer.append(&event).map(|_| ());
                     let _ = reply.send(result);
                 }
 
@@ -263,6 +281,32 @@ impl<A: Aggregate> AggregateHandle<A> {
             .await
             .map_err(|_| StateError::ActorGone)?;
         rx.await.map_err(|_| StateError::ActorGone)?
+    }
+
+    /// Inject a pre-validated event by sending it to the actor for append.
+    ///
+    /// The actor owns the exclusive `EventWriter`, so this method routes
+    /// the event through the actor's channel to avoid lock contention.
+    /// The actor appends the event and sends the I/O result back.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - A pre-validated `eventfold::Event` to append as-is.
+    ///
+    /// # Errors
+    ///
+    /// * [`io::Error`] with [`io::ErrorKind::BrokenPipe`] if the actor
+    ///   has exited and the channel is closed.
+    /// * [`io::Error`] if the underlying `EventWriter::append` fails.
+    #[allow(dead_code)]
+    pub(crate) async fn inject_via_actor(&self, event: eventfold::Event) -> io::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(ActorMessage::Inject { event, reply: tx })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "actor gone"))?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "actor gone"))?
     }
 
     /// Returns a reference to the [`EventReader`] for this aggregate's stream.
@@ -489,6 +533,28 @@ mod tests {
             .expect("respawn should succeed");
         let state = handle2.state().await.expect("state should succeed");
         assert_eq!(state.value, 1, "state should reflect the first command");
+    }
+
+    #[tokio::test]
+    async fn inject_via_actor_appends_and_updates_state() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let handle = spawn_actor::<Counter>(tmp.path()).expect("spawn_actor should succeed");
+
+        // Build a raw eventfold::Event matching the Counter's "Incremented" variant.
+        let event = eventfold::Event::new("Incremented", serde_json::Value::Null);
+
+        // Inject the event directly via the actor.
+        handle
+            .inject_via_actor(event)
+            .await
+            .expect("inject_via_actor should succeed");
+
+        // The actor's view should pick up the injected event on next refresh.
+        let state = handle.state().await.expect("state should succeed");
+        assert_eq!(
+            state.value, 1,
+            "injected Incremented event should bump counter to 1"
+        );
     }
 
     #[tokio::test]

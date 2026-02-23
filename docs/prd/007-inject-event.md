@@ -1,6 +1,6 @@
 # PRD 001: AggregateStore::inject_event()
 
-**Status:** DRAFT
+**Status:** TICKETS READY
 **Created:** 2026-02-22
 **Author:** PRD Writer Agent
 

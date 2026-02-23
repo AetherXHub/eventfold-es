@@ -2,7 +2,7 @@
 //! handle caching into a single `AggregateStore` type.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,8 +42,65 @@ type ProcessManagerList = Vec<std::sync::Mutex<Box<dyn ProcessManagerCatchUp>>>;
 /// Type-erased dispatcher map keyed by aggregate type name.
 type DispatcherMap = HashMap<String, Box<dyn AggregateDispatcher>>;
 
+/// Type-erased catch-up list for projections.
+///
+/// Mirrors the `ProcessManagerList` pattern: each entry wraps a
+/// `ProjectionRunner<P>` behind a `std::sync::Mutex` so that
+/// [`inject_event`](AggregateStore::inject_event) can trigger catch-up on
+/// all projections without knowing the concrete `P` type.
+type ProjectionCatchUpList = Vec<std::sync::Mutex<Box<dyn ProjectionCatchUpFn>>>;
+
+/// Type-erased projection catch-up interface.
+///
+/// Implemented by [`ProjectionRunner<P>`](crate::projection::ProjectionRunner)
+/// wrapper so that the store can catch up all projections without knowing
+/// the concrete `P` type parameter.
+trait ProjectionCatchUpFn: Send + Sync {
+    /// Catch up on all subscribed streams and save the checkpoint.
+    fn catch_up(&mut self) -> io::Result<()>;
+}
+
+/// Wrapper that implements [`ProjectionCatchUpFn`] by delegating to a
+/// shared `Arc<Mutex<ProjectionRunner<P>>>`. This allows the type-erased
+/// catch-up list and the typed projection map to share the same runner.
+struct SharedProjectionCatchUp<P: Projection> {
+    inner: Arc<std::sync::Mutex<ProjectionRunner<P>>>,
+}
+
+impl<P: Projection> ProjectionCatchUpFn for SharedProjectionCatchUp<P> {
+    fn catch_up(&mut self) -> io::Result<()> {
+        let mut runner = self
+            .inner
+            .lock()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        runner.catch_up()
+    }
+}
+
 /// Default idle timeout for actors: 5 minutes.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Options controlling the behaviour of [`AggregateStore::inject_event`].
+///
+/// # Examples
+///
+/// ```
+/// use eventfold_es::InjectOptions;
+///
+/// // Default: do not run process managers after injection.
+/// let opts = InjectOptions::default();
+/// assert!(!opts.run_process_managers);
+///
+/// // Opt in to process manager triggering.
+/// let opts = InjectOptions { run_process_managers: true };
+/// assert!(opts.run_process_managers);
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct InjectOptions {
+    /// When `true`, call [`AggregateStore::run_process_managers`] after
+    /// appending the event. Defaults to `false`.
+    pub run_process_managers: bool,
+}
 
 /// Central registry that manages aggregate instance lifecycles.
 ///
@@ -66,8 +123,13 @@ pub struct AggregateStore {
     layout: StreamLayout,
     cache: Arc<RwLock<HandleCache>>,
     projections: Arc<std::sync::RwLock<ProjectionMap>>,
+    /// Type-erased projection catch-up runners for [`inject_event`].
+    projection_catch_ups: Arc<std::sync::RwLock<ProjectionCatchUpList>>,
     process_managers: Arc<std::sync::RwLock<ProcessManagerList>>,
     dispatchers: Arc<DispatcherMap>,
+    /// In-memory set of event IDs already injected, for deduplication.
+    /// Shared across clones via `Arc`.
+    seen_ids: Arc<std::sync::Mutex<HashSet<String>>>,
     idle_timeout: Duration,
 }
 
@@ -109,8 +171,10 @@ impl AggregateStore {
             layout,
             cache: Arc::new(RwLock::new(HashMap::new())),
             projections: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            projection_catch_ups: Arc::new(std::sync::RwLock::new(Vec::new())),
             process_managers: Arc::new(std::sync::RwLock::new(Vec::new())),
             dispatchers: Arc::new(HashMap::new()),
+            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         })
     }
@@ -259,12 +323,13 @@ impl AggregateStore {
             )
         })?;
         // Downcast the type-erased `Box<dyn Any>` back to the concrete
-        // `Mutex<ProjectionRunner<P>>`. This is safe because `projection()`
-        // on the builder registered the runner under the same `P::NAME` key.
-        let runner_mutex = runner_any
-            .downcast_ref::<std::sync::Mutex<ProjectionRunner<P>>>()
+        // `Arc<Mutex<ProjectionRunner<P>>>`. This is safe because
+        // `projection()` on the builder registered the runner under the
+        // same `P::NAME` key.
+        let runner_arc = runner_any
+            .downcast_ref::<Arc<std::sync::Mutex<ProjectionRunner<P>>>>()
             .ok_or_else(|| io::Error::other("projection type mismatch"))?;
-        let mut runner = runner_mutex
+        let mut runner = runner_arc
             .lock()
             .map_err(|e| io::Error::other(e.to_string()))?;
         runner.catch_up()?;
@@ -298,10 +363,10 @@ impl AggregateStore {
                 format!("projection '{}' not registered", P::NAME),
             )
         })?;
-        let runner_mutex = runner_any
-            .downcast_ref::<std::sync::Mutex<ProjectionRunner<P>>>()
+        let runner_arc = runner_any
+            .downcast_ref::<Arc<std::sync::Mutex<ProjectionRunner<P>>>>()
             .ok_or_else(|| io::Error::other("projection type mismatch"))?;
-        let mut runner = runner_mutex
+        let mut runner = runner_arc
             .lock()
             .map_err(|e| io::Error::other(e.to_string()))?;
         runner.rebuild()
@@ -404,14 +469,142 @@ impl AggregateStore {
     pub fn layout(&self) -> &StreamLayout {
         &self.layout
     }
+
+    /// Append a pre-validated event directly to a stream, bypassing command
+    /// validation.
+    ///
+    /// This is the primary entry point for relay-sync scenarios where events
+    /// have already been validated on the originating client. The event is
+    /// written as-is to the stream's JSONL log, projections are caught up,
+    /// and process managers are optionally triggered.
+    ///
+    /// # Deduplication
+    ///
+    /// If `event.id` is `Some(id)` and that ID has already been seen by this
+    /// store instance, the call returns `Ok(())` immediately without writing.
+    /// Events with `event.id = None` are never deduplicated.
+    ///
+    /// # Actor interaction
+    ///
+    /// If a live actor exists for the target stream, the event is injected
+    /// through the actor's channel (preserving the actor's exclusive writer
+    /// ownership). Otherwise, a temporary `EventWriter` is opened directly.
+    ///
+    /// # Arguments
+    ///
+    /// * `instance_id` - Unique instance identifier within the aggregate type.
+    /// * `event` - A pre-validated `eventfold::Event` to append as-is.
+    /// * `opts` - Controls whether process managers run after injection.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success (including dedup no-ops).
+    ///
+    /// # Errors
+    ///
+    /// Returns `std::io::Error` if directory creation, event writing, or
+    /// projection catch-up fails.
+    pub async fn inject_event<A: Aggregate>(
+        &self,
+        instance_id: &str,
+        event: eventfold::Event,
+        opts: InjectOptions,
+    ) -> io::Result<()> {
+        // 1. Dedup check: if the event has an ID already seen, no-op.
+        let event_id = event.id.clone();
+        if let Some(ref id) = event_id {
+            let seen = self
+                .seen_ids
+                .lock()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            if seen.contains(id) {
+                return Ok(());
+            }
+        }
+
+        // 2. Ensure stream directory exists.
+        let layout = self.layout.clone();
+        let agg_type = A::AGGREGATE_TYPE.to_owned();
+        let inst_id = instance_id.to_owned();
+        let stream_dir =
+            tokio::task::spawn_blocking(move || layout.ensure_stream(&agg_type, &inst_id))
+                .await
+                .map_err(io::Error::other)??;
+
+        // 3. Append the event: route through the actor if one is alive,
+        //    otherwise open a temporary writer directly.
+        let key = (A::AGGREGATE_TYPE.to_owned(), instance_id.to_owned());
+        let injected_via_actor = {
+            let cache = self.cache.read().await;
+            if let Some(boxed) = cache.get(&key)
+                && let Some(handle) = boxed.downcast_ref::<AggregateHandle<A>>()
+                && handle.is_alive()
+            {
+                handle.inject_via_actor(event.clone()).await?;
+                true
+            } else {
+                false
+            }
+        };
+
+        if !injected_via_actor {
+            let ev = event;
+            tokio::task::spawn_blocking(move || {
+                let mut writer = eventfold::EventWriter::open(&stream_dir)?;
+                writer.append(&ev).map(|_| ())
+            })
+            .await
+            .map_err(io::Error::other)??;
+        }
+
+        // 4. Register event ID in seen_ids after successful append.
+        if let Some(id) = event_id {
+            let mut seen = self
+                .seen_ids
+                .lock()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            seen.insert(id);
+        }
+
+        // 5. Catch up all registered projections via the type-erased list.
+        {
+            let catch_ups = self
+                .projection_catch_ups
+                .read()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            for catch_up_mutex in catch_ups.iter() {
+                let mut catch_up = catch_up_mutex
+                    .lock()
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                catch_up.catch_up()?;
+            }
+        }
+
+        // 6. Optionally trigger process managers.
+        if opts.run_process_managers {
+            self.run_process_managers().await?;
+        }
+
+        Ok(())
+    }
 }
 
 /// Factory function type for creating a type-erased projection runner.
 ///
 /// Each closure captures the concrete `P: Projection` type, creates a
-/// `ProjectionRunner<P>`, wraps it in `std::sync::Mutex`, and returns it
-/// as `Box<dyn Any + Send + Sync>` for storage in the projection map.
-type ProjectionFactory = Box<dyn FnOnce(StreamLayout) -> io::Result<Box<dyn Any + Send + Sync>>>;
+/// `ProjectionRunner<P>`, and returns both:
+/// - A `Box<dyn Any + Send + Sync>` (the `Arc<Mutex<ProjectionRunner<P>>>`) for
+///   the typed projection map (used by `projection::<P>()`).
+/// - A `Mutex<Box<dyn ProjectionCatchUpFn>>` for the type-erased catch-up list
+///   (used by `inject_event`).
+type ProjectionFactory = Box<
+    dyn FnOnce(
+        StreamLayout,
+    ) -> io::Result<(
+        Box<dyn Any + Send + Sync>,
+        std::sync::Mutex<Box<dyn ProjectionCatchUpFn>>,
+    )>,
+>;
 
 /// Factory function type for creating a type-erased process manager runner.
 type ProcessManagerFactory =
@@ -470,7 +663,14 @@ impl AggregateStoreBuilder {
             P::NAME.to_owned(),
             Box::new(|layout| {
                 let runner = ProjectionRunner::<P>::new(layout)?;
-                Ok(Box::new(std::sync::Mutex::new(runner)) as Box<dyn Any + Send + Sync>)
+                let shared = Arc::new(std::sync::Mutex::new(runner));
+                // Store the Arc in the typed projection map for downcasting
+                // by `AggregateStore::projection::<P>()`.
+                let any_box: Box<dyn Any + Send + Sync> = Box::new(shared.clone());
+                // Create a type-erased catch-up wrapper sharing the same runner.
+                let catch_up: std::sync::Mutex<Box<dyn ProjectionCatchUpFn>> =
+                    std::sync::Mutex::new(Box::new(SharedProjectionCatchUp { inner: shared }));
+                Ok((any_box, catch_up))
             }),
         ));
         self
@@ -587,9 +787,11 @@ impl AggregateStoreBuilder {
             .map_err(io::Error::other)??;
 
         let mut projections = HashMap::new();
+        let mut projection_catch_ups: ProjectionCatchUpList = Vec::new();
         for (name, factory) in self.projection_factories {
-            let runner = factory(layout.clone())?;
-            projections.insert(name, runner);
+            let (any_runner, catch_up) = factory(layout.clone())?;
+            projections.insert(name, any_runner);
+            projection_catch_ups.push(catch_up);
         }
 
         let mut process_managers = Vec::new();
@@ -607,8 +809,10 @@ impl AggregateStoreBuilder {
             layout,
             cache: Arc::new(RwLock::new(HashMap::new())),
             projections: Arc::new(std::sync::RwLock::new(projections)),
+            projection_catch_ups: Arc::new(std::sync::RwLock::new(projection_catch_ups)),
             process_managers: Arc::new(std::sync::RwLock::new(process_managers)),
             dispatchers: Arc::new(dispatchers),
+            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
             idle_timeout: self.idle_timeout,
         })
     }
@@ -1278,5 +1482,208 @@ mod tests {
         );
         let state = handle.state().await.expect("state should succeed");
         assert_eq!(state.value, 5);
+    }
+
+    // --- inject_event tests ---
+
+    /// Helper: build an event matching Counter's "Incremented" variant.
+    fn incremented_event() -> eventfold::Event {
+        eventfold::Event::new("Incremented", serde_json::Value::Null)
+    }
+
+    #[tokio::test]
+    async fn inject_event_appends_to_stream() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        store
+            .inject_event::<Counter>("c-1", incremented_event(), InjectOptions::default())
+            .await
+            .expect("inject_event should succeed");
+
+        // Verify the event appears in the JSONL file.
+        let jsonl_path = tmp.path().join("streams/counter/c-1/app.jsonl");
+        let contents = std::fs::read_to_string(&jsonl_path).expect("app.jsonl should exist");
+        assert_eq!(
+            contents.lines().count(),
+            1,
+            "should have exactly one event line"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_event_projections_reflect_event() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::builder(tmp.path())
+            .projection::<EventCounter>()
+            .open()
+            .await
+            .expect("builder open should succeed");
+
+        store
+            .inject_event::<Counter>("c-1", incremented_event(), InjectOptions::default())
+            .await
+            .expect("inject_event should succeed");
+
+        let counter = store
+            .projection::<EventCounter>()
+            .expect("projection query should succeed");
+        assert_eq!(counter.count, 1);
+    }
+
+    #[tokio::test]
+    async fn inject_event_dedup_by_id() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        let event = incremented_event().with_id("ev-1".to_string());
+
+        // First injection should succeed and write.
+        store
+            .inject_event::<Counter>("c-1", event.clone(), InjectOptions::default())
+            .await
+            .expect("first inject should succeed");
+
+        // Second injection with the same ID should be a no-op.
+        store
+            .inject_event::<Counter>("c-1", event, InjectOptions::default())
+            .await
+            .expect("second inject should succeed (no-op)");
+
+        // Verify only one event in the JSONL.
+        let jsonl_path = tmp.path().join("streams/counter/c-1/app.jsonl");
+        let contents = std::fs::read_to_string(&jsonl_path).expect("app.jsonl should exist");
+        assert_eq!(
+            contents.lines().count(),
+            1,
+            "dedup should prevent second write"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_event_no_dedup_for_none_id() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        // Events with id=None should never be deduplicated.
+        let event = incremented_event();
+        assert!(event.id.is_none(), "precondition: id is None");
+
+        store
+            .inject_event::<Counter>("c-1", event.clone(), InjectOptions::default())
+            .await
+            .expect("first inject should succeed");
+
+        store
+            .inject_event::<Counter>("c-1", event, InjectOptions::default())
+            .await
+            .expect("second inject should succeed");
+
+        let jsonl_path = tmp.path().join("streams/counter/c-1/app.jsonl");
+        let contents = std::fs::read_to_string(&jsonl_path).expect("app.jsonl should exist");
+        assert_eq!(contents.lines().count(), 2, "both events should be written");
+    }
+
+    #[tokio::test]
+    async fn inject_options_default_does_not_run_process_managers() {
+        let opts = InjectOptions::default();
+        assert!(!opts.run_process_managers);
+    }
+
+    #[tokio::test]
+    async fn inject_event_with_process_managers() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::builder(tmp.path())
+            .process_manager::<ForwardSaga>()
+            .aggregate_type::<Receiver>()
+            .open()
+            .await
+            .expect("builder open should succeed");
+
+        store
+            .inject_event::<Counter>(
+                "c-1",
+                incremented_event(),
+                InjectOptions {
+                    run_process_managers: true,
+                },
+            )
+            .await
+            .expect("inject_event should succeed");
+
+        // The ForwardSaga should have dispatched a command to Receiver.
+        let receiver_handle = store
+            .get::<Receiver>("c-1")
+            .await
+            .expect("get receiver should succeed");
+        let receiver_state = receiver_handle
+            .state()
+            .await
+            .expect("receiver state should succeed");
+        assert_eq!(
+            receiver_state.received_count, 1,
+            "process manager should have dispatched"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_event_with_live_actor() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        // Spawn an actor for c-1 by getting a handle.
+        let handle = store
+            .get::<Counter>("c-1")
+            .await
+            .expect("get should succeed");
+        assert!(handle.is_alive(), "actor should be alive");
+
+        // Inject an event -- should route through the live actor.
+        store
+            .inject_event::<Counter>("c-1", incremented_event(), InjectOptions::default())
+            .await
+            .expect("inject_event with live actor should succeed");
+
+        // The actor's view should reflect the injected event.
+        let state = handle.state().await.expect("state should succeed");
+        assert_eq!(state.value, 1, "actor should see the injected event");
+    }
+
+    #[tokio::test]
+    async fn inject_event_creates_new_stream() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        // Inject into a stream that doesn't exist yet.
+        store
+            .inject_event::<Counter>(
+                "new-instance",
+                incremented_event(),
+                InjectOptions::default(),
+            )
+            .await
+            .expect("inject_event should create stream");
+
+        // Verify the directory was created.
+        let stream_dir = tmp.path().join("streams/counter/new-instance");
+        assert!(stream_dir.is_dir(), "stream directory should exist");
+
+        // Verify state via a fresh actor.
+        let handle = store
+            .get::<Counter>("new-instance")
+            .await
+            .expect("get should succeed after inject");
+        let state = handle.state().await.expect("state should succeed");
+        assert_eq!(state.value, 1, "actor should replay the injected event");
     }
 }

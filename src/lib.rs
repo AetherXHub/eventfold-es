@@ -81,4 +81,4 @@ pub use error::{DispatchError, ExecuteError, StateError};
 pub use process_manager::{ProcessManager, ProcessManagerReport};
 pub use projection::Projection;
 pub use storage::StreamLayout;
-pub use store::{AggregateStore, AggregateStoreBuilder};
+pub use store::{AggregateStore, AggregateStoreBuilder, InjectOptions};
