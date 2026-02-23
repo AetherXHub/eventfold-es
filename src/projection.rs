@@ -309,7 +309,6 @@ impl<P: Projection> ProjectionRunner<P> {
     /// # Errors
     ///
     /// Returns `io::Error` if deleting the checkpoint or catching up fails.
-    #[allow(dead_code)] // Used in integration tests.
     pub(crate) fn rebuild(&mut self) -> io::Result<()> {
         delete_checkpoint(&self.checkpoint_dir)?;
         self.checkpoint = ProjectionCheckpoint::default();

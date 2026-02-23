@@ -271,6 +271,42 @@ impl AggregateStore {
         Ok(runner.state().clone())
     }
 
+    /// Delete the checkpoint for projection `P` and replay all events from scratch.
+    ///
+    /// This acquires the projections read-lock, downcasts to the concrete
+    /// `ProjectionRunner<P>`, and calls `rebuild()` which:
+    /// 1. Deletes the checkpoint file
+    /// 2. Resets internal state to `ProjectionCheckpoint::default()`
+    /// 3. Calls `catch_up()` to replay all events from offset 0
+    /// 4. Saves the new checkpoint
+    ///
+    /// **Blocking I/O** -- if called from an async context,
+    /// wrap this in `tokio::task::spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::ErrorKind::NotFound` if the projection is not registered.
+    /// Returns `io::Error` if deleting the checkpoint or catching up fails.
+    pub fn rebuild_projection<P: Projection>(&self) -> io::Result<()> {
+        let projections = self
+            .projections
+            .read()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let runner_any = projections.get(P::NAME).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("projection '{}' not registered", P::NAME),
+            )
+        })?;
+        let runner_mutex = runner_any
+            .downcast_ref::<std::sync::Mutex<ProjectionRunner<P>>>()
+            .ok_or_else(|| io::Error::other("projection type mismatch"))?;
+        let mut runner = runner_mutex
+            .lock()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        runner.rebuild()
+    }
+
     /// Run all registered process managers through a catch-up pass.
     ///
     /// For each process manager:
