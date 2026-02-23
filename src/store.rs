@@ -470,6 +470,116 @@ impl AggregateStore {
         &self.layout
     }
 
+    /// List all known `(aggregate_type, instance_id)` pairs.
+    ///
+    /// When `aggregate_type` is `Some`, returns only streams for that type.
+    /// When `None`, returns streams across all aggregate types. Results are
+    /// sorted by aggregate type then instance ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `aggregate_type` - Optional filter. When `Some`, only streams for
+    ///   that aggregate type are returned. When `None`, all streams are
+    ///   returned.
+    ///
+    /// # Returns
+    ///
+    /// A sorted `Vec<(String, String)>` of `(aggregate_type, instance_id)`
+    /// pairs. Returns an empty vector if no matching streams exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `std::io::Error` if reading the directory fails.
+    pub async fn list_streams(
+        &self,
+        aggregate_type: Option<&str>,
+    ) -> io::Result<Vec<(String, String)>> {
+        let layout = self.layout.clone();
+        match aggregate_type {
+            Some(agg_type) => {
+                let agg_type = agg_type.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    let ids = layout.list_streams(&agg_type)?;
+                    Ok(ids.into_iter().map(|id| (agg_type.clone(), id)).collect())
+                })
+                .await
+                .map_err(io::Error::other)?
+            }
+            None => tokio::task::spawn_blocking(move || {
+                let types = layout.list_aggregate_types()?;
+                let mut pairs = Vec::new();
+                for agg_type in types {
+                    let ids = layout.list_streams(&agg_type)?;
+                    pairs.extend(ids.into_iter().map(|id| (agg_type.clone(), id)));
+                }
+                Ok(pairs)
+            })
+            .await
+            .map_err(io::Error::other)?,
+        }
+    }
+
+    /// Read all raw events from a stream identified by aggregate type and
+    /// instance ID.
+    ///
+    /// Returns the events in the order they were appended. Does not spawn
+    /// an actor or acquire a write lock on the stream.
+    ///
+    /// # Arguments
+    ///
+    /// * `aggregate_type` - The aggregate type name (e.g. `"counter"`).
+    /// * `instance_id` - The unique instance identifier within that type.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<eventfold::Event>` containing all events in the stream.
+    /// Returns `Ok(vec![])` if the stream directory exists but no events
+    /// have been written yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns `std::io::Error` with `ErrorKind::NotFound` if the stream
+    /// directory does not exist (i.e. the stream was never created).
+    /// Returns `std::io::Error` for other I/O failures during reading.
+    pub async fn read_events(
+        &self,
+        aggregate_type: &str,
+        instance_id: &str,
+    ) -> io::Result<Vec<eventfold::Event>> {
+        let layout = self.layout.clone();
+        let agg_type = aggregate_type.to_owned();
+        let inst_id = instance_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let stream_dir = layout.stream_dir(&agg_type, &inst_id);
+
+            // If the stream directory itself does not exist, return NotFound.
+            if !stream_dir.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("stream directory not found: {}", stream_dir.display()),
+                ));
+            }
+
+            let reader = eventfold::EventReader::new(&stream_dir);
+            // read_from(0) returns NotFound when app.jsonl doesn't exist yet
+            // (stream dir created but no events written). Map that to empty vec.
+            let iter = match reader.read_from(0) {
+                Ok(iter) => iter,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            };
+
+            let mut events = Vec::new();
+            for result in iter {
+                let (event, _next_offset, _line_hash) = result?;
+                events.push(event);
+            }
+            Ok(events)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
     /// Append a pre-validated event directly to a stream, bypassing command
     /// validation.
     ///
@@ -1685,5 +1795,189 @@ mod tests {
             .expect("get should succeed after inject");
         let state = handle.state().await.expect("state should succeed");
         assert_eq!(state.value, 1, "actor should replay the injected event");
+    }
+
+    // --- list_streams / read_events tests ---
+
+    // Minimal second aggregate type shared by list_streams tests.
+    #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Toggle {
+        pub on: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "type", content = "data")]
+    enum ToggleEvent {
+        Toggled,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum ToggleError {}
+
+    impl Aggregate for Toggle {
+        const AGGREGATE_TYPE: &'static str = "toggle";
+        type Command = ();
+        type DomainEvent = ToggleEvent;
+        type Error = ToggleError;
+
+        fn handle(&self, _cmd: ()) -> Result<Vec<ToggleEvent>, ToggleError> {
+            Ok(vec![ToggleEvent::Toggled])
+        }
+
+        fn apply(mut self, _event: &ToggleEvent) -> Self {
+            self.on = !self.on;
+            self
+        }
+    }
+
+    /// Helper: execute a single Toggle command on the given instance.
+    async fn toggle(store: &AggregateStore, id: &str) {
+        let handle = store
+            .get::<Toggle>(id)
+            .await
+            .expect("get toggle should succeed");
+        handle
+            .execute((), CommandContext::default())
+            .await
+            .expect("toggle should succeed");
+    }
+
+    #[tokio::test]
+    async fn list_streams_none_returns_all_sorted() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        // Create counter instances c-1, c-2 and toggle instance t-1.
+        increment(&store, "c-1").await;
+        increment(&store, "c-2").await;
+        toggle(&store, "t-1").await;
+
+        let pairs = store
+            .list_streams(None)
+            .await
+            .expect("list_streams(None) should succeed");
+
+        assert_eq!(
+            pairs,
+            vec![
+                ("counter".to_owned(), "c-1".to_owned()),
+                ("counter".to_owned(), "c-2".to_owned()),
+                ("toggle".to_owned(), "t-1".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_streams_some_filters_by_type() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        increment(&store, "c-1").await;
+        increment(&store, "c-2").await;
+        toggle(&store, "t-1").await;
+
+        let pairs = store
+            .list_streams(Some("counter"))
+            .await
+            .expect("list_streams(Some) should succeed");
+
+        assert_eq!(
+            pairs,
+            vec![
+                ("counter".to_owned(), "c-1".to_owned()),
+                ("counter".to_owned(), "c-2".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_streams_none_empty_store() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        let pairs = store
+            .list_streams(None)
+            .await
+            .expect("list_streams(None) on empty store should succeed");
+
+        assert!(pairs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_streams_some_nonexistent_type() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        let pairs = store
+            .list_streams(Some("nonexistent"))
+            .await
+            .expect("list_streams(Some(nonexistent)) should succeed");
+
+        assert!(pairs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_events_returns_all_events() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        increment(&store, "c-1").await;
+        increment(&store, "c-1").await;
+
+        let events = store
+            .read_events("counter", "c-1")
+            .await
+            .expect("read_events should succeed");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "Incremented");
+        assert_eq!(events[1].event_type, "Incremented");
+    }
+
+    #[tokio::test]
+    async fn read_events_empty_stream_returns_empty_vec() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        // Create the stream directory without executing any commands.
+        let _handle = store
+            .get::<Counter>("c-1")
+            .await
+            .expect("get should succeed");
+
+        // Drop the handle's actor so the flock is released, then read.
+        // The stream directory exists but app.jsonl may or may not exist.
+        // In either case read_events should return Ok(vec![]).
+        let events = store
+            .read_events("counter", "c-1")
+            .await
+            .expect("read_events on empty stream should succeed");
+
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_events_nonexistent_stream_returns_not_found() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store = AggregateStore::open(tmp.path())
+            .await
+            .expect("open should succeed");
+
+        let result = store.read_events("nonexistent", "x").await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 }

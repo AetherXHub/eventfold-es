@@ -1,6 +1,6 @@
 # PRD 005: AggregateStore Stream Enumeration API
 
-**Status:** DRAFT
+**Status:** TICKETS READY
 **Created:** 2026-02-22
 **Author:** PRD Writer Agent
 **GitHub Issue:** #5

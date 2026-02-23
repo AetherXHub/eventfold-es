@@ -187,6 +187,44 @@ impl StreamLayout {
         Ok(dir)
     }
 
+    /// Lists all aggregate type names that have at least one stream directory.
+    ///
+    /// Reads the `<base_dir>/streams/` directory and returns the name of each
+    /// subdirectory, sorted lexicographically.
+    ///
+    /// # Returns
+    ///
+    /// A sorted `Vec<String>` of aggregate type names. Returns an empty vector
+    /// if the `streams/` directory does not exist or is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns `std::io::Error` if reading the directory fails for a reason
+    /// other than the directory not existing.
+    pub(crate) fn list_aggregate_types(&self) -> std::io::Result<Vec<String>> {
+        let streams_dir = self.base_dir.join("streams");
+
+        let entries = match fs::read_dir(&streams_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let mut types: Vec<String> = entries
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                entry
+                    .file_type()
+                    .ok()?
+                    .is_dir()
+                    .then(|| entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect();
+
+        types.sort();
+        Ok(types)
+    }
+
     /// Lists all instance IDs for the given aggregate type.
     ///
     /// # Arguments
@@ -341,6 +379,39 @@ mod tests {
             .expect("list_streams should succeed");
 
         assert_eq!(streams, vec!["alpha", "bravo", "charlie"]);
+    }
+
+    #[test]
+    fn list_aggregate_types_returns_sorted_types() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let layout = StreamLayout::new(tmp.path());
+
+        // Create streams for two aggregate types in non-sorted order.
+        layout
+            .ensure_stream("toggle", "t-1")
+            .expect("ensure_stream should succeed");
+        layout
+            .ensure_stream("counter", "c-1")
+            .expect("ensure_stream should succeed");
+
+        let types = layout
+            .list_aggregate_types()
+            .expect("list_aggregate_types should succeed");
+
+        assert_eq!(types, vec!["counter", "toggle"]);
+    }
+
+    #[test]
+    fn list_aggregate_types_empty_when_no_streams_dir() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let layout = StreamLayout::new(tmp.path());
+
+        // No streams directory created -- should return empty vec.
+        let types = layout
+            .list_aggregate_types()
+            .expect("list_aggregate_types should succeed");
+
+        assert!(types.is_empty());
     }
 
     #[test]
