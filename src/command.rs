@@ -41,6 +41,13 @@ pub struct CommandContext {
     pub correlation_id: Option<String>,
     /// Arbitrary metadata forwarded to `eventfold::Event::meta`.
     pub metadata: Option<Value>,
+    /// The device ID of the client that issued the command.
+    ///
+    /// Stamped into `event.meta["source_device"]` by `to_eventfold_event`.
+    /// Skipped during serialization when `None` to maintain backward
+    /// compatibility with existing JSONL records.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_device: Option<String>,
 }
 
 impl CommandContext {
@@ -86,6 +93,26 @@ impl CommandContext {
     /// The updated `CommandContext` with the metadata set.
     pub fn with_metadata(mut self, meta: Value) -> Self {
         self.metadata = Some(meta);
+        self
+    }
+
+    /// Set the source device ID.
+    ///
+    /// The device ID identifies which client device originated this
+    /// command. It is stamped into `event.meta["source_device"]` by
+    /// `to_eventfold_event`, making it available to projections, process
+    /// managers, and downstream sync consumers.
+    ///
+    /// # Arguments
+    ///
+    /// * `device_id` - Any value convertible to `String` identifying the
+    ///   originating device (e.g. a UUID or hostname).
+    ///
+    /// # Returns
+    ///
+    /// The updated `CommandContext` with the source device set.
+    pub fn with_source_device(mut self, device_id: impl Into<String>) -> Self {
+        self.source_device = Some(device_id.into());
         self
     }
 }
@@ -273,6 +300,7 @@ mod tests {
         assert_eq!(ctx.actor, None);
         assert_eq!(ctx.correlation_id, None);
         assert_eq!(ctx.metadata, None);
+        assert_eq!(ctx.source_device, None);
     }
 
     #[test]
@@ -299,11 +327,19 @@ mod tests {
         let ctx = CommandContext::default()
             .with_actor("admin")
             .with_correlation_id("req-abc")
-            .with_metadata(json!({"source": "test"}));
+            .with_metadata(json!({"source": "test"}))
+            .with_source_device("phone-42");
 
         assert_eq!(ctx.actor.as_deref(), Some("admin"));
         assert_eq!(ctx.correlation_id.as_deref(), Some("req-abc"));
         assert_eq!(ctx.metadata, Some(json!({"source": "test"})));
+        assert_eq!(ctx.source_device.as_deref(), Some("phone-42"));
+    }
+
+    #[test]
+    fn builder_sets_source_device() {
+        let ctx = CommandContext::default().with_source_device("device-abc");
+        assert_eq!(ctx.source_device.as_deref(), Some("device-abc"));
     }
 
     #[test]
@@ -312,10 +348,12 @@ mod tests {
         // not just `&str` literals.
         let ctx = CommandContext::default()
             .with_actor(String::from("svc-payments"))
-            .with_correlation_id(String::from("id-007"));
+            .with_correlation_id(String::from("id-007"))
+            .with_source_device(String::from("laptop-01"));
 
         assert_eq!(ctx.actor.as_deref(), Some("svc-payments"));
         assert_eq!(ctx.correlation_id.as_deref(), Some("id-007"));
+        assert_eq!(ctx.source_device.as_deref(), Some("laptop-01"));
     }
 
     #[test]
@@ -341,7 +379,8 @@ mod tests {
         let ctx = CommandContext::default()
             .with_actor("user-1")
             .with_correlation_id("corr-1")
-            .with_metadata(json!({"key": "value"}));
+            .with_metadata(json!({"key": "value"}))
+            .with_source_device("device-xyz");
 
         let json = serde_json::to_string(&ctx).expect("serialization should succeed");
         let deserialized: CommandContext =
@@ -350,6 +389,29 @@ mod tests {
         assert_eq!(deserialized.actor, ctx.actor);
         assert_eq!(deserialized.correlation_id, ctx.correlation_id);
         assert_eq!(deserialized.metadata, ctx.metadata);
+        assert_eq!(deserialized.source_device, ctx.source_device);
+    }
+
+    #[test]
+    fn source_device_none_omitted_from_json() {
+        // When source_device is None, the key must not appear in JSON output.
+        let ctx = CommandContext::default().with_actor("user-1");
+        let json = serde_json::to_string(&ctx).expect("serialization should succeed");
+        assert!(
+            !json.contains("source_device"),
+            "source_device key should be absent when None, got: {json}"
+        );
+    }
+
+    #[test]
+    fn deserialize_legacy_json_without_source_device() {
+        // Simulates a JSON record produced by a prior version of the library
+        // that has no source_device key. Must deserialize with source_device = None.
+        let legacy_json = r#"{"actor":"old-user","correlation_id":"old-corr","metadata":null}"#;
+        let ctx: CommandContext =
+            serde_json::from_str(legacy_json).expect("deserialization should succeed");
+        assert_eq!(ctx.actor.as_deref(), Some("old-user"));
+        assert_eq!(ctx.source_device, None);
     }
 
     #[test]

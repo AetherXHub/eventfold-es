@@ -156,6 +156,13 @@ pub fn to_eventfold_event<A: Aggregate>(
         );
     }
 
+    if let Some(ref device_id) = ctx.source_device {
+        meta_map.insert(
+            "source_device".to_string(),
+            serde_json::Value::String(device_id.clone()),
+        );
+    }
+
     if !meta_map.is_empty() {
         event = event.with_meta(serde_json::Value::Object(meta_map));
     }
@@ -406,6 +413,57 @@ mod tests {
         assert_ne!(
             event_a.id, event_b.id,
             "successive events must have distinct ids"
+        );
+    }
+
+    #[test]
+    fn context_propagates_source_device() {
+        let ctx = CommandContext::default().with_source_device("device-xyz");
+        let event = to_eventfold_event::<Counter>(&CounterEvent::Incremented, &ctx).unwrap();
+
+        let meta = event.meta.expect("meta should be present");
+        assert_eq!(meta["source_device"], "device-xyz");
+    }
+
+    #[test]
+    fn context_propagates_source_device_and_correlation_id() {
+        let ctx = CommandContext::default()
+            .with_correlation_id("req-abc")
+            .with_source_device("device-xyz");
+        let event = to_eventfold_event::<Counter>(&CounterEvent::Incremented, &ctx).unwrap();
+
+        let meta = event.meta.expect("meta should be present");
+        assert_eq!(meta["correlation_id"], "req-abc");
+        assert_eq!(meta["source_device"], "device-xyz");
+    }
+
+    #[test]
+    fn context_merges_source_device_with_existing_metadata() {
+        let ctx = CommandContext::default()
+            .with_metadata(serde_json::json!({"foo": "bar", "level": 3}))
+            .with_source_device("device-xyz");
+        let event = to_eventfold_event::<Counter>(&CounterEvent::Incremented, &ctx).unwrap();
+
+        let meta = event.meta.expect("meta should be present");
+        assert_eq!(meta["foo"], "bar");
+        assert_eq!(meta["level"], 3);
+        assert_eq!(meta["source_device"], "device-xyz");
+    }
+
+    #[test]
+    fn all_none_context_produces_no_meta() {
+        // When source_device, correlation_id, and metadata are all None,
+        // the resulting event should have meta == None (no empty object).
+        let ctx = CommandContext::default();
+        assert!(ctx.source_device.is_none());
+        assert!(ctx.correlation_id.is_none());
+        assert!(ctx.metadata.is_none());
+
+        let event = to_eventfold_event::<Counter>(&CounterEvent::Incremented, &ctx).unwrap();
+        assert!(
+            event.meta.is_none(),
+            "meta should be None when all context fields are None, got: {:?}",
+            event.meta
         );
     }
 

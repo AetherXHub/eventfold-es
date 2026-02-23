@@ -1,6 +1,6 @@
 # PRD 005: Source Device Stamping in CommandContext
 
-**Status:** DRAFT
+**Status:** TICKETS READY
 **Created:** 2026-02-22
 **Author:** PRD Writer Agent
 **GitHub Issue:** #3
