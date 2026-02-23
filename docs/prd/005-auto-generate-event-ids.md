@@ -1,6 +1,6 @@
 # PRD 001: Auto-Generate Event IDs (UUID v4) in `to_eventfold_event`
 
-**Status:** DRAFT
+**Status:** TICKETS READY
 **Created:** 2026-02-22
 **Author:** PRD Writer Agent
 

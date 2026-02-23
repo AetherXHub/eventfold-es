@@ -2,6 +2,7 @@
 
 use crate::command::CommandContext;
 use serde::{Serialize, de::DeserializeOwned};
+use uuid::Uuid;
 
 /// A domain aggregate whose state is derived from its event history.
 ///
@@ -134,7 +135,7 @@ pub fn to_eventfold_event<A: Aggregate>(
     // Data may be absent for fieldless variants.
     let data = obj.get("data").cloned().unwrap_or(serde_json::Value::Null);
 
-    let mut event = eventfold::Event::new(event_type, data);
+    let mut event = eventfold::Event::new(event_type, data).with_id(Uuid::new_v4().to_string());
 
     // Propagate actor from the command context.
     if let Some(ref actor) = ctx.actor {
@@ -367,5 +368,62 @@ mod tests {
         // Round-trip through the reducer.
         let state = reducer::<Counter>()(Counter::default(), &event);
         assert_eq!(state.value, 1);
+    }
+
+    // --- UUID v4 event ID tests ---
+
+    #[test]
+    fn to_eventfold_event_assigns_uuid_v4_id() {
+        let event =
+            to_eventfold_event::<Counter>(&CounterEvent::Incremented, &CommandContext::default())
+                .unwrap();
+
+        // The event must carry a Some(id) that is a valid UUID v4 string.
+        let id = event.id.expect("event.id should be Some");
+
+        // Parse with the uuid crate to validate format and version.
+        let parsed = uuid::Uuid::parse_str(&id)
+            .unwrap_or_else(|e| panic!("event id '{id}' is not a valid UUID: {e}"));
+        assert_eq!(
+            parsed.get_version(),
+            Some(uuid::Version::Random),
+            "event id '{id}' is not UUID v4 (version = {:?})",
+            parsed.get_version()
+        );
+
+        // Also verify the lowercase hyphenated format matches the canonical
+        // UUID v4 regex from the acceptance criteria.
+        assert_eq!(id, parsed.as_hyphenated().to_string());
+    }
+
+    #[test]
+    fn to_eventfold_event_produces_distinct_ids() {
+        let ctx = CommandContext::default();
+        let event_a = to_eventfold_event::<Counter>(&CounterEvent::Incremented, &ctx).unwrap();
+        let event_b = to_eventfold_event::<Counter>(&CounterEvent::Incremented, &ctx).unwrap();
+
+        // Two successive calls must produce different IDs.
+        assert_ne!(
+            event_a.id, event_b.id,
+            "successive events must have distinct ids"
+        );
+    }
+
+    #[test]
+    fn reducer_applies_event_with_no_id() {
+        // Simulate a pre-existing log entry that has no id field (id: None).
+        // The reducer must still apply it correctly.
+        let event_with_id_none = eventfold::Event::new("Incremented", serde_json::Value::Null);
+        assert!(event_with_id_none.id.is_none(), "precondition: id is None");
+
+        // Known event type advances state.
+        let state = reducer::<Counter>()(Counter::default(), &event_with_id_none);
+        assert_eq!(state.value, 1);
+
+        // Unknown event type leaves state unchanged.
+        let unknown_event = eventfold::Event::new("SomeFutureEvent", serde_json::json!({}));
+        assert!(unknown_event.id.is_none(), "precondition: id is None");
+        let state = reducer::<Counter>()(Counter::default(), &unknown_event);
+        assert_eq!(state.value, 0);
     }
 }
