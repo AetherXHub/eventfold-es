@@ -25,6 +25,10 @@ jobs:
           curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" -o protoc.zip
           unzip -q protoc.zip -d /usr/local
           protoc --version
+      - name: Check vendored proto is in sync
+        run: |
+          git clone --depth 1 https://github.com/AetherXHub/eventfold-db.git /tmp/eventfold-db
+          diff proto/eventfold.proto /tmp/eventfold-db/proto/eventfold.proto
       - name: Build
         run: cargo build --locked
       - name: Test
