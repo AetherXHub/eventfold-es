@@ -1,24 +1,33 @@
 [package]
 name = "eventfold-es"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "Embedded event-sourcing framework built on eventfold"
+description = "Event-sourcing framework backed by eventfold-db gRPC server"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/aetherxhub/eventfold-es"
 readme = "README.md"
 keywords = ["event-sourcing", "cqrs", "aggregate", "eventfold", "embedded"]
 categories = ["data-structures", "database"]
+# Examples require a running eventfold-db server to execute, but they
+# compile against the library as a build-time check.
+autoexamples = true
 
 [lib]
 
 [dependencies]
-eventfold = "0.2.0"
+bytes = "1"
+prost = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+tokio-stream = "0.1"
+tonic = "0.13"
 tracing = "0.1"
+uuid = { version = "1", features = ["v4", "v5"] }
+
+[build-dependencies]
+tonic-build = "0.13"
 
 [dev-dependencies]
 tempfile = "3"

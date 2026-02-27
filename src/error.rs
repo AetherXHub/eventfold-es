@@ -20,9 +20,9 @@ pub enum ExecuteError<E: std::error::Error + Send + Sync + 'static> {
     /// Optimistic concurrency retries exhausted.
     ///
     /// The command was retried the maximum number of times but each
-    /// attempt encountered a version conflict with a concurrent writer.
-    #[error("optimistic concurrency conflict: retries exhausted")]
-    Conflict,
+    /// attempt encountered a stream version mismatch with a concurrent writer.
+    #[error("wrong expected version: retries exhausted")]
+    WrongExpectedVersion,
 
     /// Disk I/O failure.
     ///
@@ -30,6 +30,13 @@ pub enum ExecuteError<E: std::error::Error + Send + Sync + 'static> {
     /// while loading or persisting events.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// gRPC transport or server error.
+    ///
+    /// The underlying tonic gRPC call returned a non-OK status, indicating
+    /// a network failure, server error, or protocol-level rejection.
+    #[error("gRPC transport error: {0}")]
+    Transport(tonic::Status),
 
     /// Actor thread exited unexpectedly.
     ///
@@ -49,6 +56,13 @@ pub enum StateError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// gRPC transport or server error.
+    ///
+    /// The underlying tonic gRPC call returned a non-OK status, indicating
+    /// a network failure, server error, or protocol-level rejection.
+    #[error("gRPC transport error: {0}")]
+    Transport(tonic::Status),
+
     /// Actor thread exited unexpectedly.
     ///
     /// The background actor that owns this aggregate has shut down,
@@ -59,9 +73,8 @@ pub enum StateError {
 
 /// Errors that can occur when dispatching a command.
 ///
-/// Produced by the dispatch layer ([`CommandBus`](crate::CommandBus) or
-/// process manager dispatch) when a command cannot be routed to or executed
-/// by the target aggregate.
+/// Produced by the process manager dispatch layer when a command envelope
+/// cannot be routed to or executed by the target aggregate.
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
     /// No dispatcher registered for the target aggregate type.
@@ -70,8 +83,8 @@ pub enum DispatchError {
 
     /// No route registered for the command type.
     ///
-    /// Returned by [`CommandBus::dispatch`](crate::CommandBus::dispatch) when
-    /// the command's concrete type has not been registered via `register::<A>()`.
+    /// Returned when the command's target aggregate type has not been
+    /// registered via [`AggregateStoreBuilder::aggregate_type`](crate::AggregateStoreBuilder::aggregate_type).
     #[error("no route registered for command type")]
     UnknownCommand,
 
@@ -106,12 +119,9 @@ mod tests {
     }
 
     #[test]
-    fn execute_error_conflict_display() {
-        let err: ExecuteError<TestDomainError> = ExecuteError::Conflict;
-        assert_eq!(
-            err.to_string(),
-            "optimistic concurrency conflict: retries exhausted"
-        );
+    fn execute_error_wrong_expected_version_display_message() {
+        let err: ExecuteError<TestDomainError> = ExecuteError::WrongExpectedVersion;
+        assert_eq!(err.to_string(), "wrong expected version: retries exhausted");
     }
 
     #[test]
@@ -138,6 +148,35 @@ mod tests {
     fn state_error_actor_gone_display() {
         let err = StateError::ActorGone;
         assert_eq!(err.to_string(), "aggregate actor is no longer running");
+    }
+
+    #[test]
+    fn execute_error_wrong_expected_version_display() {
+        let err: ExecuteError<TestDomainError> = ExecuteError::WrongExpectedVersion;
+        let msg = err.to_string();
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn execute_error_transport_display() {
+        let status = tonic::Status::internal("boom");
+        let err: ExecuteError<TestDomainError> = ExecuteError::Transport(status);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("boom") || msg.contains("gRPC"),
+            "expected 'boom' or 'gRPC' in: {msg}"
+        );
+    }
+
+    #[test]
+    fn state_error_transport_display() {
+        let status = tonic::Status::unavailable("server down");
+        let err = StateError::Transport(status);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("server down") || msg.contains("gRPC"),
+            "expected 'server down' or 'gRPC' in: {msg}"
+        );
     }
 
     // Verify `Send + Sync` bounds are satisfied so errors can cross thread

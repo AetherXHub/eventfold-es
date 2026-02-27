@@ -1,30 +1,97 @@
-//! Actor loop that owns an aggregate and processes commands.
+//! Actor loop that owns an aggregate and processes commands via gRPC.
 //!
-//! The actor runs on a blocking thread and sequentially processes messages
-//! from an `mpsc` channel. It exclusively owns the `EventWriter` (and
-//! therefore the flock), the `View<A>` for maintaining aggregate state,
-//! and the `EventReader` for refreshing the view before each command.
+//! The actor runs as a tokio task and sequentially processes messages
+//! from an `mpsc` channel. It holds the aggregate state, stream version,
+//! and stream UUID, communicating with the event store through the
+//! [`EventStoreOps`] trait (implemented by [`EsClient`] for production use).
 //!
 //! Public API: [`AggregateHandle`] (cloneable async handle) and
-//! [`spawn_actor`] (factory that opens the log and starts the actor thread).
+//! [`spawn_actor_with_config`] (factory that loads a snapshot and starts
+//! the actor task).
 
-use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use eventfold::{EventReader, EventWriter, View};
+use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, oneshot};
+use tracing::Instrument;
+use uuid::Uuid;
 
-use crate::aggregate::{Aggregate, reducer, to_eventfold_event};
+use crate::aggregate::Aggregate;
+use crate::client::ExpectedVersionArg;
 use crate::command::CommandContext;
 use crate::error::{ExecuteError, StateError};
+use crate::event::{ProposedEventData, encode_domain_event, stream_uuid};
+use crate::proto::RecordedEvent;
+use crate::snapshot::{Snapshot, load_snapshot, save_snapshot};
 
 /// Maximum number of optimistic concurrency retries before giving up.
+const MAX_RETRIES: u32 = 3;
+
+/// Abstraction over event store operations for testability.
 ///
-/// Currently unused because the actor exclusively owns the writer, so
-/// conflicts cannot occur. Retained for future `append_if` support.
-#[allow(dead_code)]
-const DEFAULT_MAX_RETRIES: u32 = 3;
+/// [`EsClient`](crate::EsClient) implements this trait for production use.
+/// Tests can provide a mock implementation without starting a gRPC server.
+#[tonic::async_trait]
+pub(crate) trait EventStoreOps: Send + Sync + 'static {
+    /// Append events to a stream with optimistic concurrency control.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_id` - Target stream UUID.
+    /// * `expected` - Expected stream version for OCC.
+    /// * `events` - Events to append.
+    ///
+    /// # Errors
+    ///
+    /// Returns `tonic::Status` on failure (e.g. `FAILED_PRECONDITION` for
+    /// version conflicts).
+    async fn append(
+        &mut self,
+        stream_id: Uuid,
+        expected: ExpectedVersionArg,
+        events: Vec<ProposedEventData>,
+    ) -> Result<crate::proto::AppendResponse, tonic::Status>;
+
+    /// Read events from a stream starting at a given version.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_id` - The stream UUID.
+    /// * `from_version` - Zero-based version to start reading from.
+    /// * `max_count` - Maximum number of events to return.
+    ///
+    /// # Errors
+    ///
+    /// Returns `tonic::Status` on failure.
+    async fn read_stream(
+        &mut self,
+        stream_id: Uuid,
+        from_version: u64,
+        max_count: u64,
+    ) -> Result<Vec<RecordedEvent>, tonic::Status>;
+}
+
+#[tonic::async_trait]
+impl EventStoreOps for crate::client::EsClient {
+    async fn append(
+        &mut self,
+        stream_id: Uuid,
+        expected: ExpectedVersionArg,
+        events: Vec<ProposedEventData>,
+    ) -> Result<crate::proto::AppendResponse, tonic::Status> {
+        self.append(stream_id, expected, events).await
+    }
+
+    async fn read_stream(
+        &mut self,
+        stream_id: Uuid,
+        from_version: u64,
+        max_count: u64,
+    ) -> Result<Vec<RecordedEvent>, tonic::Status> {
+        self.read_stream(stream_id, from_version, max_count).await
+    }
+}
 
 /// Configuration for the actor loop.
 ///
@@ -32,7 +99,6 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 /// [`AggregateStoreBuilder::idle_timeout`](crate::AggregateStoreBuilder::idle_timeout).
 pub(crate) struct ActorConfig {
     /// How long the actor waits for a message before shutting down.
-    /// An effectively infinite value means the actor never idles out.
     pub idle_timeout: Duration,
 }
 
@@ -61,148 +127,27 @@ pub(crate) enum ActorMessage<A: Aggregate> {
         reply: oneshot::Sender<Result<A, StateError>>,
     },
 
-    /// Inject a pre-validated `eventfold::Event` directly into the stream.
+    /// Inject a pre-built [`ProposedEventData`] directly into the stream.
     ///
-    /// The actor appends the event via its owned `EventWriter` and sends
-    /// the I/O result back on `reply`. This keeps the actor as the sole
-    /// writer for any stream that has a live actor.
+    /// The actor appends with `ExpectedVersion::Any` and sends the result
+    /// back on `reply`.
+    #[allow(dead_code)] // Constructed via inject_via_actor; used in tests.
     Inject {
-        /// The pre-validated event to append as-is.
-        event: eventfold::Event,
-        /// Channel to send back the I/O result.
-        reply: oneshot::Sender<io::Result<()>>,
+        /// The proposed event to append.
+        proposed: ProposedEventData,
+        /// Channel to send back the gRPC result.
+        reply: oneshot::Sender<Result<(), tonic::Status>>,
     },
 
     /// Gracefully shut down the actor loop.
-    #[allow(dead_code)] // Constructed only in tests.
+    #[allow(dead_code)] // Used in tests for controlled shutdown.
     Shutdown,
-}
-
-/// Runs the aggregate actor loop on a blocking thread.
-///
-/// Owns the `EventWriter` and aggregate state `View`. Receives messages
-/// from `AggregateHandle` via the mpsc channel and processes them sequentially.
-/// The loop exits when the channel closes (all senders dropped), a
-/// `Shutdown` message is received, or the idle timeout elapses. On exit the
-/// `EventWriter` is dropped, releasing the flock.
-///
-/// # Arguments
-///
-/// * `writer` - Exclusive writer for the aggregate's event stream.
-/// * `view` - Derived view that holds the current aggregate state.
-/// * `reader` - Reader used to refresh the view before each operation.
-/// * `rx` - Receiving end of the mpsc channel carrying `ActorMessage`s.
-/// * `config` - Actor configuration (idle timeout).
-pub(crate) fn run_actor<A: Aggregate>(
-    mut writer: EventWriter,
-    mut view: View<A>,
-    reader: EventReader,
-    mut rx: mpsc::Receiver<ActorMessage<A>>,
-    config: ActorConfig,
-) {
-    // Build a lightweight current-thread runtime with time enabled.
-    // The actor needs `tokio::time::timeout` to implement idle eviction,
-    // but the parent runtime may be current-thread (common in tests),
-    // which doesn't drive timers from non-runtime threads. A dedicated
-    // minimal runtime avoids that constraint and keeps the actor
-    // self-contained.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .expect("failed to create actor timeout runtime");
-
-    loop {
-        // Create the timeout future INSIDE `block_on` so that the `Sleep`
-        // timer registers with the local runtime's time driver.
-        let idle_timeout = config.idle_timeout;
-        let msg = rt.block_on(async { tokio::time::timeout(idle_timeout, rx.recv()).await });
-
-        match msg {
-            // Received a message before the timeout elapsed.
-            Ok(Some(msg)) => match msg {
-                ActorMessage::Execute { cmd, ctx, reply } => {
-                    let _span = tracing::info_span!("execute", aggregate_type = A::AGGREGATE_TYPE,)
-                        .entered();
-                    let result = execute_command::<A>(&mut writer, &mut view, &reader, cmd, &ctx);
-                    // If the receiver was dropped, the caller no longer cares
-                    // about the result. Silently discard it.
-                    let _ = reply.send(result);
-                }
-
-                ActorMessage::GetState { reply } => {
-                    let result = get_state::<A>(&mut view, &reader);
-                    let _ = reply.send(result);
-                }
-
-                ActorMessage::Inject { event, reply } => {
-                    let result = writer.append(&event).map(|_| ());
-                    let _ = reply.send(result);
-                }
-
-                ActorMessage::Shutdown => break,
-            },
-            // Channel closed: all senders dropped.
-            Ok(None) => break,
-            // Idle timeout elapsed with no messages.
-            Err(_elapsed) => {
-                tracing::info!(
-                    aggregate_type = A::AGGREGATE_TYPE,
-                    "actor idle, shutting down"
-                );
-                break;
-            }
-        }
-    }
-    // Loop exited: either `Shutdown` received, channel closed, or idle timeout.
-    // `writer` is dropped here, releasing the flock on the event log.
-}
-
-/// Execute a single command: refresh state, handle the command, persist events.
-///
-/// Factored out of the match arm for clarity and to keep the actor loop concise.
-fn execute_command<A: Aggregate>(
-    writer: &mut EventWriter,
-    view: &mut View<A>,
-    reader: &EventReader,
-    cmd: A::Command,
-    ctx: &CommandContext,
-) -> Result<Vec<A::DomainEvent>, ExecuteError<A::Error>> {
-    // 1. Refresh the view to incorporate any events not yet folded.
-    //    Although we are the sole writer, a prior iteration may have
-    //    appended events that the view hasn't consumed yet.
-    view.refresh(reader).map_err(ExecuteError::Io)?;
-
-    // 2. Decide: run the command handler against current state.
-    let state = view.state().clone();
-    let domain_events = state.handle(cmd).map_err(ExecuteError::Domain)?;
-
-    // 3. No-op commands produce no events.
-    if domain_events.is_empty() {
-        return Ok(domain_events);
-    }
-
-    // 4. Convert each domain event to an `eventfold::Event` and append.
-    for de in &domain_events {
-        let ef_event = to_eventfold_event::<A>(de, ctx)
-            .map_err(|e| ExecuteError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
-        writer.append(&ef_event).map_err(ExecuteError::Io)?;
-    }
-
-    tracing::info!(count = domain_events.len(), "events appended");
-
-    Ok(domain_events)
-}
-
-/// Refresh the view and return a clone of the current aggregate state.
-fn get_state<A: Aggregate>(view: &mut View<A>, reader: &EventReader) -> Result<A, StateError> {
-    view.refresh(reader).map_err(StateError::Io)?;
-    Ok(view.state().clone())
 }
 
 /// Async handle to a running aggregate actor.
 ///
 /// Lightweight, cloneable, and `Send + Sync`. Communicates with the
-/// actor thread over a bounded channel.
+/// actor task over a bounded channel.
 ///
 /// # Type Parameters
 ///
@@ -210,17 +155,14 @@ fn get_state<A: Aggregate>(view: &mut View<A>, reader: &EventReader) -> Result<A
 #[derive(Debug)]
 pub struct AggregateHandle<A: Aggregate> {
     sender: mpsc::Sender<ActorMessage<A>>,
-    reader: EventReader,
 }
 
 // Manual `Clone` because `A` itself need not be `Clone` for the handle --
-// we only clone the `Sender` and `EventReader`, both of which are always
-// `Clone` regardless of `A`.
+// we only clone the `Sender`, which is always `Clone` regardless of `A`.
 impl<A: Aggregate> Clone for AggregateHandle<A> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
-            reader: self.reader.clone(),
         }
     }
 }
@@ -242,8 +184,10 @@ impl<A: Aggregate> AggregateHandle<A> {
     /// # Errors
     ///
     /// * [`ExecuteError::Domain`] -- the aggregate rejected the command.
-    /// * [`ExecuteError::Io`] -- a disk I/O error occurred.
-    /// * [`ExecuteError::ActorGone`] -- the actor thread has exited.
+    /// * [`ExecuteError::WrongExpectedVersion`] -- retries exhausted after
+    ///   concurrent version conflicts.
+    /// * [`ExecuteError::Transport`] -- a gRPC error occurred.
+    /// * [`ExecuteError::ActorGone`] -- the actor task has exited.
     pub async fn execute(
         &self,
         cmd: A::Command,
@@ -263,16 +207,13 @@ impl<A: Aggregate> AggregateHandle<A> {
 
     /// Read the current aggregate state.
     ///
-    /// Refreshes the view from disk before returning.
-    ///
     /// # Returns
     ///
     /// A clone of the current aggregate state.
     ///
     /// # Errors
     ///
-    /// * [`StateError::Io`] -- a disk I/O error occurred.
-    /// * [`StateError::ActorGone`] -- the actor thread has exited.
+    /// * [`StateError::ActorGone`] -- the actor task has exited.
     pub async fn state(&self) -> Result<A, StateError> {
         let (tx, rx) = oneshot::channel();
         self.sender
@@ -282,54 +223,314 @@ impl<A: Aggregate> AggregateHandle<A> {
         rx.await.map_err(|_| StateError::ActorGone)?
     }
 
-    /// Inject a pre-validated event by sending it to the actor for append.
+    /// Inject a pre-built [`ProposedEventData`] by sending it to the actor.
     ///
-    /// The actor owns the exclusive `EventWriter`, so this method routes
-    /// the event through the actor's channel to avoid lock contention.
-    /// The actor appends the event and sends the I/O result back.
+    /// The actor appends with `ExpectedVersion::Any` and returns the gRPC
+    /// result.
     ///
     /// # Arguments
     ///
-    /// * `event` - A pre-validated `eventfold::Event` to append as-is.
+    /// * `proposed` - A pre-built proposed event to append as-is.
     ///
     /// # Errors
     ///
-    /// * [`io::Error`] with [`io::ErrorKind::BrokenPipe`] if the actor
-    ///   has exited and the channel is closed.
-    /// * [`io::Error`] if the underlying `EventWriter::append` fails.
-    pub(crate) async fn inject_via_actor(&self, event: eventfold::Event) -> io::Result<()> {
+    /// * [`tonic::Status`] if the gRPC append fails.
+    /// * `tonic::Status` with `CANCELLED` code if the actor has exited.
+    #[allow(dead_code)] // Actor-based injection path; used in tests.
+    pub(crate) async fn inject_via_actor(
+        &self,
+        proposed: ProposedEventData,
+    ) -> Result<(), tonic::Status> {
         let (tx, rx) = oneshot::channel();
         self.sender
-            .send(ActorMessage::Inject { event, reply: tx })
+            .send(ActorMessage::Inject {
+                proposed,
+                reply: tx,
+            })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "actor gone"))?;
+            .map_err(|_| tonic::Status::cancelled("actor gone"))?;
         rx.await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "actor gone"))?
-    }
-
-    /// Returns a reference to the [`EventReader`] for this aggregate's stream.
-    pub fn reader(&self) -> &EventReader {
-        &self.reader
+            .map_err(|_| tonic::Status::cancelled("actor gone"))?
     }
 
     /// Check whether the actor backing this handle is still running.
     ///
-    /// Returns `false` if the actor thread has exited (e.g. due to idle
+    /// Returns `false` if the actor task has exited (e.g. due to idle
     /// timeout or shutdown). The store uses this to evict stale handles
     /// from its cache and re-spawn the actor on the next `get` call.
     pub fn is_alive(&self) -> bool {
         !self.sender.is_closed()
     }
+
+    /// Construct an `AggregateHandle` from a raw sender.
+    ///
+    /// Used in tests to create handles without spawning an actor task.
+    #[cfg(test)]
+    pub(crate) fn from_sender(sender: mpsc::Sender<ActorMessage<A>>) -> Self {
+        Self { sender }
+    }
+}
+
+/// Decode a [`RecordedEvent`] payload into a domain event for folding.
+///
+/// Reconstructs the adjacently-tagged JSON (`{"type": ..., "data": ...}`)
+/// from the event's `event_type` and `payload` fields, then deserializes
+/// into the aggregate's `DomainEvent` type.
+fn decode_domain_event<A: Aggregate>(recorded: &RecordedEvent) -> Option<A::DomainEvent>
+where
+    A::DomainEvent: DeserializeOwned,
+{
+    // Reconstruct the adjacently-tagged envelope that serde expects.
+    let payload_str = std::str::from_utf8(&recorded.payload).ok()?;
+    let payload_value: serde_json::Value = if payload_str.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(payload_str).ok()?
+    };
+
+    let envelope = if payload_value.is_null() {
+        // Unit variant: {"type": "Incremented"}
+        serde_json::json!({"type": recorded.event_type})
+    } else {
+        // Data variant: {"type": "Added", "data": {"amount": 42}}
+        serde_json::json!({"type": recorded.event_type, "data": payload_value})
+    };
+
+    serde_json::from_value(envelope).ok()
+}
+
+/// Bundled context passed to the actor loop.
+///
+/// Groups the immutable identity fields and storage references so that
+/// `run_actor` stays within the parameter limit.
+struct ActorContext<S> {
+    store: S,
+    stream_id: Uuid,
+    instance_id: String,
+    base_dir: PathBuf,
+    config: ActorConfig,
+}
+
+/// Run the actor loop as an async task.
+///
+/// Processes messages from the channel, executing commands with optimistic
+/// concurrency retries, and saves a snapshot on shutdown.
+async fn run_actor<A, S>(
+    mut ctx: ActorContext<S>,
+    mut state: A,
+    mut stream_version: u64,
+    mut rx: mpsc::Receiver<ActorMessage<A>>,
+) where
+    A: Aggregate,
+    A::Command: Clone,
+    A::DomainEvent: DeserializeOwned,
+    S: EventStoreOps,
+{
+    loop {
+        let idle_timeout = ctx.config.idle_timeout;
+        let msg = tokio::time::timeout(idle_timeout, rx.recv()).await;
+
+        match msg {
+            Ok(Some(msg)) => match msg {
+                ActorMessage::Execute {
+                    cmd,
+                    ctx: cmd_ctx,
+                    reply,
+                } => {
+                    let span = tracing::info_span!("execute", aggregate_type = A::AGGREGATE_TYPE);
+                    let result = execute_with_retry::<A, S>(
+                        &mut ctx.store,
+                        &mut state,
+                        &mut stream_version,
+                        ctx.stream_id,
+                        &ctx.instance_id,
+                        cmd,
+                        &cmd_ctx,
+                    )
+                    .instrument(span)
+                    .await;
+                    let _ = reply.send(result);
+                }
+
+                ActorMessage::GetState { reply } => {
+                    let _ = reply.send(Ok(state.clone()));
+                }
+
+                ActorMessage::Inject { proposed, reply } => {
+                    let result = ctx
+                        .store
+                        .append(ctx.stream_id, ExpectedVersionArg::Any, vec![proposed])
+                        .await;
+                    match result {
+                        Ok(_resp) => {
+                            // Re-read to update local state after injection.
+                            if let Ok(events) = ctx
+                                .store
+                                .read_stream(ctx.stream_id, stream_version + 1, u64::MAX)
+                                .await
+                            {
+                                for ev in &events {
+                                    if let Some(domain_event) = decode_domain_event::<A>(ev) {
+                                        state = state.apply(&domain_event);
+                                    }
+                                    stream_version = ev.stream_version;
+                                }
+                            }
+                            let _ = reply.send(Ok(()));
+                        }
+                        Err(status) => {
+                            let _ = reply.send(Err(status));
+                        }
+                    }
+                }
+
+                ActorMessage::Shutdown => {
+                    save_snapshot_quietly::<A>(
+                        &ctx.base_dir,
+                        &ctx.instance_id,
+                        &state,
+                        stream_version,
+                    );
+                    break;
+                }
+            },
+            // Channel closed: all senders dropped.
+            Ok(None) => {
+                save_snapshot_quietly::<A>(&ctx.base_dir, &ctx.instance_id, &state, stream_version);
+                break;
+            }
+            // Idle timeout elapsed.
+            Err(_elapsed) => {
+                tracing::info!(
+                    aggregate_type = A::AGGREGATE_TYPE,
+                    "actor idle, shutting down"
+                );
+                save_snapshot_quietly::<A>(&ctx.base_dir, &ctx.instance_id, &state, stream_version);
+                break;
+            }
+        }
+    }
+}
+
+/// Save a snapshot, logging any error but not propagating it.
+fn save_snapshot_quietly<A: Aggregate>(
+    base_dir: &Path,
+    instance_id: &str,
+    state: &A,
+    stream_version: u64,
+) {
+    let snap = Snapshot {
+        state: state.clone(),
+        stream_version,
+    };
+    if let Err(e) = save_snapshot::<A>(base_dir, instance_id, &snap) {
+        tracing::error!(
+            error = %e,
+            aggregate_type = A::AGGREGATE_TYPE,
+            instance_id,
+            "failed to save snapshot on shutdown"
+        );
+    }
+}
+
+/// Execute a command with optimistic concurrency retry.
+///
+/// On `FAILED_PRECONDITION`, re-reads events from the server, re-folds
+/// state, and retries up to [`MAX_RETRIES`] times.
+async fn execute_with_retry<A, S>(
+    store: &mut S,
+    state: &mut A,
+    stream_version: &mut u64,
+    stream_id: Uuid,
+    instance_id: &str,
+    cmd: A::Command,
+    ctx: &CommandContext,
+) -> Result<Vec<A::DomainEvent>, ExecuteError<A::Error>>
+where
+    A: Aggregate,
+    A::DomainEvent: DeserializeOwned,
+    S: EventStoreOps,
+    A::Command: Clone,
+{
+    for attempt in 0..MAX_RETRIES {
+        // 1. Decide: run the command handler against current state.
+        let domain_events = state
+            .clone()
+            .handle(cmd.clone())
+            .map_err(ExecuteError::Domain)?;
+
+        // No-op commands produce no events.
+        if domain_events.is_empty() {
+            return Ok(domain_events);
+        }
+
+        // 2. Encode domain events for gRPC submission.
+        let proposed: Vec<ProposedEventData> = domain_events
+            .iter()
+            .map(|de| encode_domain_event::<A>(de, ctx, A::AGGREGATE_TYPE, instance_id))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                ExecuteError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+
+        // 3. Append with Exact(version) for OCC.
+        match store
+            .append(
+                stream_id,
+                ExpectedVersionArg::Exact(*stream_version),
+                proposed,
+            )
+            .await
+        {
+            Ok(resp) => {
+                // Success: fold events into local state, advance version.
+                for de in &domain_events {
+                    *state = state.clone().apply(de);
+                }
+                *stream_version = resp.last_stream_version;
+                tracing::info!(count = domain_events.len(), "events appended");
+                return Ok(domain_events);
+            }
+            Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    max = MAX_RETRIES,
+                    "version conflict, re-reading and retrying"
+                );
+                // Re-read from server to catch up with concurrent writes.
+                let events = store
+                    .read_stream(stream_id, *stream_version + 1, u64::MAX)
+                    .await
+                    .map_err(ExecuteError::Transport)?;
+                for ev in &events {
+                    if let Some(domain_event) = decode_domain_event::<A>(ev) {
+                        *state = state.clone().apply(&domain_event);
+                    }
+                    *stream_version = ev.stream_version;
+                }
+                // Loop back and retry the command against updated state.
+            }
+            Err(status) => {
+                return Err(ExecuteError::Transport(status));
+            }
+        }
+    }
+
+    // All retries exhausted.
+    Err(ExecuteError::WrongExpectedVersion)
 }
 
 /// Spawn a new aggregate actor with explicit configuration.
 ///
-/// This is the internal entry point used by [`AggregateStore`](crate::AggregateStore)
-/// to pass an idle timeout to the actor loop.
+/// Loads a snapshot from disk (if present), derives the stream UUID,
+/// catches up by reading new events from the server, then starts the
+/// actor loop as a tokio task.
 ///
 /// # Arguments
 ///
-/// * `stream_dir` - Path to the directory containing the event log.
+/// * `instance_id` - The aggregate instance identifier (e.g. "c-1").
+/// * `client` - The gRPC client for communicating with eventfold-db.
+/// * `base_dir` - Root directory for local snapshot storage.
 /// * `config` - Actor configuration (idle timeout).
 ///
 /// # Returns
@@ -338,247 +539,312 @@ impl<A: Aggregate> AggregateHandle<A> {
 ///
 /// # Errors
 ///
-/// Returns [`std::io::Error`] if the event log cannot be opened.
-pub(crate) fn spawn_actor_with_config<A: Aggregate>(
-    stream_dir: &Path,
+/// Returns [`tonic::Status`] if the catch-up read fails.
+/// Returns [`std::io::Error`] if the snapshot cannot be loaded.
+pub(crate) async fn spawn_actor_with_config<A: Aggregate>(
+    instance_id: &str,
+    client: crate::client::EsClient,
+    base_dir: &Path,
     config: ActorConfig,
-) -> io::Result<AggregateHandle<A>> {
-    let writer = EventWriter::open(stream_dir)?;
-    let reader = writer.reader();
-    let views_dir = stream_dir.join("views");
-    let view = View::<A>::new("state", reducer::<A>(), &views_dir);
-    let (tx, rx) = mpsc::channel::<ActorMessage<A>>(32);
-    let handle_reader = reader.clone();
-
-    std::thread::spawn(move || {
-        run_actor::<A>(writer, view, reader, rx, config);
-    });
-
-    Ok(AggregateHandle {
-        sender: tx,
-        reader: handle_reader,
-    })
+) -> Result<AggregateHandle<A>, tonic::Status>
+where
+    A::Command: Clone,
+    A::DomainEvent: DeserializeOwned,
+{
+    spawn_actor_with_store(instance_id, client, base_dir, config).await
 }
 
-/// Spawn a new aggregate actor for the stream at `stream_dir`.
+/// Internal spawn helper that is generic over the store implementation.
 ///
-/// Opens the [`EventWriter`], creates an [`EventReader`] and aggregate
-/// state [`View`], then starts the actor loop on a dedicated blocking
-/// thread.
-///
-/// The actor created by this function uses an effectively infinite idle
-/// timeout. For configurable timeouts, use
-/// [`AggregateStoreBuilder::idle_timeout`](crate::AggregateStoreBuilder::idle_timeout).
-///
-/// # Arguments
-///
-/// * `stream_dir` - Path to the directory containing the event log
-///   (e.g. `<base>/streams/<type>/<id>`).
-///
-/// # Returns
-///
-/// An [`AggregateHandle`] for sending commands and reading state.
-///
-/// # Errors
-///
-/// Returns [`std::io::Error`] if the event log cannot be opened.
-pub fn spawn_actor<A: Aggregate>(stream_dir: &Path) -> io::Result<AggregateHandle<A>> {
-    // Use an effectively infinite timeout so the actor never idles out.
-    // `u64::MAX / 2` avoids overflow when tokio adds the timeout duration
-    // to the current `Instant`.
-    let config = ActorConfig {
-        idle_timeout: Duration::from_secs(u64::MAX / 2),
+/// This enables tests to inject a mock [`EventStoreOps`] without needing
+/// a real gRPC server.
+async fn spawn_actor_with_store<A, S>(
+    instance_id: &str,
+    mut store: S,
+    base_dir: &Path,
+    config: ActorConfig,
+) -> Result<AggregateHandle<A>, tonic::Status>
+where
+    A: Aggregate,
+    A::Command: Clone,
+    A::DomainEvent: DeserializeOwned,
+    S: EventStoreOps,
+{
+    let stream_id = stream_uuid(A::AGGREGATE_TYPE, instance_id);
+
+    // Load snapshot from disk (cache miss is Ok(None)).
+    let snapshot: Option<Snapshot<A>> = load_snapshot::<A>(base_dir, instance_id)
+        .map_err(|e| tonic::Status::internal(format!("snapshot load error: {e}")))?;
+
+    // Determine starting state and the version to read from.
+    // If a snapshot exists at stream_version N, events 0..=N have been
+    // applied, so catch-up starts at N + 1.
+    // If no snapshot exists, start from version 0 (the beginning).
+    let (mut state, mut version, from_version) = match snapshot {
+        Some(snap) => {
+            let from = snap.stream_version + 1;
+            (snap.state, snap.stream_version, from)
+        }
+        None => (A::default(), 0, 0),
     };
-    spawn_actor_with_config(stream_dir, config)
+
+    let events = store.read_stream(stream_id, from_version, u64::MAX).await?;
+    for ev in &events {
+        if let Some(domain_event) = decode_domain_event::<A>(ev) {
+            state = state.apply(&domain_event);
+        }
+        version = ev.stream_version;
+    }
+
+    let (tx, rx) = mpsc::channel::<ActorMessage<A>>(32);
+
+    let actor_ctx = ActorContext {
+        store,
+        stream_id,
+        instance_id: instance_id.to_string(),
+        base_dir: base_dir.to_path_buf(),
+        config,
+    };
+
+    tokio::spawn(async move {
+        run_actor::<A, S>(actor_ctx, state, version, rx).await;
+    });
+
+    Ok(AggregateHandle { sender: tx })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use tempfile::TempDir;
-
     use super::*;
-    use crate::aggregate::test_fixtures::{Counter, CounterCommand, CounterError, CounterEvent};
-    use crate::error::ExecuteError;
+    use crate::aggregate::test_fixtures::{Counter, CounterCommand};
+    use crate::proto::AppendResponse;
 
-    #[tokio::test]
-    async fn execute_increment_three_times() {
-        let tmp = TempDir::new().expect("failed to create temp dir");
-        let handle = spawn_actor::<Counter>(tmp.path()).expect("spawn_actor should succeed");
-
-        let ctx = CommandContext::default();
-        for _ in 0..3 {
-            handle
-                .execute(CounterCommand::Increment, ctx.clone())
-                .await
-                .expect("execute should succeed");
-        }
-
-        let state = handle.state().await.expect("state should succeed");
-        assert_eq!(state.value, 3);
+    /// A configurable mock event store for testing.
+    ///
+    /// Stores events in memory and allows configuring append behavior
+    /// (e.g. returning FAILED_PRECONDITION for version conflict tests).
+    #[derive(Clone)]
+    struct MockStore {
+        /// Shared mutable state for the mock store.
+        inner: Arc<Mutex<MockStoreInner>>,
     }
 
+    struct MockStoreInner {
+        /// Events stored in this mock, keyed by stream.
+        events: Vec<RecordedEvent>,
+        /// Number of FAILED_PRECONDITION errors to return before succeeding.
+        precondition_failures_remaining: u32,
+        /// Next stream version to assign.
+        next_version: u64,
+    }
+
+    impl MockStore {
+        /// Create a new mock store with no precondition failures.
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(MockStoreInner {
+                    events: Vec::new(),
+                    precondition_failures_remaining: 0,
+                    next_version: 0,
+                })),
+            }
+        }
+
+        /// Create a mock store that fails the first N appends with
+        /// FAILED_PRECONDITION.
+        fn with_precondition_failures(n: u32) -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(MockStoreInner {
+                    events: Vec::new(),
+                    precondition_failures_remaining: n,
+                    next_version: 0,
+                })),
+            }
+        }
+
+        /// Seed the mock with pre-existing events.
+        fn with_events(self, events: Vec<RecordedEvent>) -> Self {
+            let mut inner = self.inner.lock().expect("lock mock store");
+            inner.next_version = events.last().map_or(0, |e| e.stream_version + 1);
+            inner.events = events;
+            drop(inner);
+            self
+        }
+    }
+
+    #[tonic::async_trait]
+    impl EventStoreOps for MockStore {
+        async fn append(
+            &mut self,
+            _stream_id: Uuid,
+            _expected: ExpectedVersionArg,
+            events: Vec<ProposedEventData>,
+        ) -> Result<AppendResponse, tonic::Status> {
+            let mut inner = self.inner.lock().expect("lock mock store");
+
+            if inner.precondition_failures_remaining > 0 {
+                inner.precondition_failures_remaining -= 1;
+                return Err(tonic::Status::failed_precondition("wrong expected version"));
+            }
+
+            // Record the events.
+            for proposed in &events {
+                let recorded = RecordedEvent {
+                    event_id: proposed.event_id.to_string(),
+                    stream_id: _stream_id.to_string(),
+                    stream_version: inner.next_version,
+                    global_position: inner.events.len() as u64,
+                    event_type: proposed.event_type.clone(),
+                    payload: serde_json::to_vec(&proposed.payload).unwrap_or_default(),
+                    metadata: serde_json::to_vec(&proposed.metadata).unwrap_or_default(),
+                    recorded_at: 1_700_000_000_000,
+                };
+                inner.events.push(recorded);
+                inner.next_version += 1;
+            }
+
+            Ok(AppendResponse {
+                first_stream_version: inner.next_version - events.len() as u64,
+                last_stream_version: inner.next_version - 1,
+                first_global_position: 0,
+                last_global_position: 0,
+            })
+        }
+
+        async fn read_stream(
+            &mut self,
+            _stream_id: Uuid,
+            from_version: u64,
+            max_count: u64,
+        ) -> Result<Vec<RecordedEvent>, tonic::Status> {
+            let inner = self.inner.lock().expect("lock mock store");
+            let result: Vec<RecordedEvent> = inner
+                .events
+                .iter()
+                .filter(|e| e.stream_version >= from_version)
+                .take(max_count as usize)
+                .cloned()
+                .collect();
+            Ok(result)
+        }
+    }
+
+    /// Helper to spawn a test actor with a mock store.
+    async fn spawn_test_actor(
+        store: MockStore,
+        base_dir: &Path,
+        instance_id: &str,
+    ) -> AggregateHandle<Counter> {
+        let config = ActorConfig {
+            idle_timeout: Duration::from_secs(u64::MAX / 2),
+        };
+        spawn_actor_with_store::<Counter, MockStore>(instance_id, store, base_dir, config)
+            .await
+            .expect("spawn_actor_with_store should succeed")
+    }
+
+    // ---- Test: 3x FAILED_PRECONDITION returns WrongExpectedVersion ----
+
     #[tokio::test]
-    async fn execute_decrement_at_zero_returns_domain_error() {
-        let tmp = TempDir::new().expect("failed to create temp dir");
-        let handle = spawn_actor::<Counter>(tmp.path()).expect("spawn_actor should succeed");
+    async fn three_precondition_failures_returns_wrong_expected_version() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = MockStore::with_precondition_failures(3);
+        let handle = spawn_test_actor(store, tmp.path(), "c-fail").await;
 
         let result = handle
-            .execute(CounterCommand::Decrement, CommandContext::default())
+            .execute(CounterCommand::Increment, CommandContext::default())
             .await;
 
         assert!(
-            matches!(result, Err(ExecuteError::Domain(CounterError::AlreadyZero))),
-            "expected Domain(AlreadyZero), got: {result:?}"
+            matches!(result, Err(ExecuteError::WrongExpectedVersion)),
+            "expected WrongExpectedVersion, got: {result:?}"
         );
     }
 
-    #[tokio::test]
-    async fn state_persists_across_respawn() {
-        let tmp = TempDir::new().expect("failed to create temp dir");
+    // ---- Test: execute Increment, Shutdown, snapshot saved ----
 
-        // First actor: increment twice, then drop the handle.
-        {
-            let handle = spawn_actor::<Counter>(tmp.path()).expect("spawn_actor should succeed");
-            let ctx = CommandContext::default();
-            handle
-                .execute(CounterCommand::Increment, ctx.clone())
+    #[tokio::test]
+    async fn execute_then_shutdown_saves_snapshot() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = MockStore::new();
+        let config = ActorConfig {
+            idle_timeout: Duration::from_secs(u64::MAX / 2),
+        };
+        let handle =
+            spawn_actor_with_store::<Counter, MockStore>("c-snap", store, tmp.path(), config)
                 .await
-                .expect("first increment should succeed");
-            handle
-                .execute(CounterCommand::Increment, ctx)
-                .await
-                .expect("second increment should succeed");
-        }
-        // Handle dropped -- channel closes, actor exits.
+                .expect("spawn should succeed");
 
-        // Brief sleep to let the actor thread finish and release the
-        // flock before we open a new writer on the same directory.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Second actor on the same directory should recover the state.
-        let handle = spawn_actor::<Counter>(tmp.path()).expect("respawn should succeed");
-        let state = handle.state().await.expect("state should succeed");
-        assert_eq!(state.value, 2);
-    }
-
-    #[tokio::test]
-    async fn sequential_commands_correct() {
-        let tmp = TempDir::new().expect("failed to create temp dir");
-        let handle = spawn_actor::<Counter>(tmp.path()).expect("spawn_actor should succeed");
-        let ctx = CommandContext::default();
-
+        // Execute one Increment command.
         handle
-            .execute(CounterCommand::Increment, ctx.clone())
-            .await
-            .expect("increment should succeed");
-        handle
-            .execute(CounterCommand::Add(10), ctx.clone())
-            .await
-            .expect("add should succeed");
-        handle
-            .execute(CounterCommand::Decrement, ctx)
-            .await
-            .expect("decrement should succeed");
-
-        let state = handle.state().await.expect("state should succeed");
-        assert_eq!(state.value, 10);
-    }
-
-    #[tokio::test]
-    async fn execute_returns_produced_events() {
-        let tmp = TempDir::new().expect("failed to create temp dir");
-        let handle = spawn_actor::<Counter>(tmp.path()).expect("spawn_actor should succeed");
-
-        let events = handle
             .execute(CounterCommand::Increment, CommandContext::default())
             .await
             .expect("execute should succeed");
 
-        assert_eq!(events, vec![CounterEvent::Incremented]);
-    }
-
-    #[tokio::test]
-    async fn idle_timeout_shuts_down_actor() {
-        let tmp = TempDir::new().expect("failed to create temp dir");
-        let config = ActorConfig {
-            idle_timeout: Duration::from_millis(200),
-        };
-        let handle =
-            spawn_actor_with_config::<Counter>(tmp.path(), config).expect("spawn should succeed");
-
-        // Execute a command before the timeout.
+        // Send Shutdown so the actor saves a snapshot before exiting.
         handle
-            .execute(CounterCommand::Increment, CommandContext::default())
+            .sender
+            .send(ActorMessage::Shutdown)
             .await
-            .expect("first execute should succeed");
+            .expect("send Shutdown should succeed");
+        // Brief sleep to let the actor task process the shutdown.
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Wait for idle timeout to elapse.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-
-        // Actor should have shut down.
-        assert!(
-            !handle.is_alive(),
-            "actor should be dead after idle timeout"
+        // Load the snapshot and verify.
+        let snap: Option<Snapshot<Counter>> =
+            load_snapshot::<Counter>(tmp.path(), "c-snap").expect("load_snapshot should succeed");
+        let snap = snap.expect("snapshot should exist");
+        assert_eq!(
+            snap.stream_version, 0,
+            "stream_version should be 0 (first event at version 0)"
         );
-
-        // Re-spawn on the same directory recovers state from disk.
-        let config2 = ActorConfig {
-            idle_timeout: Duration::from_secs(u64::MAX / 2),
-        };
-        let handle2 = spawn_actor_with_config::<Counter>(tmp.path(), config2)
-            .expect("respawn should succeed");
-        let state = handle2.state().await.expect("state should succeed");
-        assert_eq!(state.value, 1, "state should reflect the first command");
+        assert_eq!(
+            snap.state.value, 1,
+            "state.value should be 1 after one Increment"
+        );
     }
 
+    // ---- Test: pre-existing snapshot + catch-up from server ----
+
     #[tokio::test]
-    async fn inject_via_actor_appends_and_updates_state() {
-        let tmp = TempDir::new().expect("failed to create temp dir");
-        let handle = spawn_actor::<Counter>(tmp.path()).expect("spawn_actor should succeed");
+    async fn spawn_with_snapshot_catches_up_from_server() {
+        let tmp = tempfile::tempdir().expect("temp dir");
 
-        // Build a raw eventfold::Event matching the Counter's "Incremented" variant.
-        let event = eventfold::Event::new("Incremented", serde_json::Value::Null);
+        // Save a pre-existing snapshot at stream_version = 2, value = 2.
+        let snap = Snapshot {
+            state: Counter { value: 2 },
+            stream_version: 2,
+        };
+        save_snapshot::<Counter>(tmp.path(), "c-catchup", &snap)
+            .expect("save_snapshot should succeed");
 
-        // Inject the event directly via the actor.
-        handle
-            .inject_via_actor(event)
-            .await
-            .expect("inject_via_actor should succeed");
+        // Build a mock with one additional event at version 3 (Incremented).
+        let stream_id = stream_uuid("counter", "c-catchup");
+        let metadata = serde_json::json!({
+            "aggregate_type": "counter",
+            "instance_id": "c-catchup"
+        });
+        let extra_event = RecordedEvent {
+            event_id: Uuid::new_v4().to_string(),
+            stream_id: stream_id.to_string(),
+            stream_version: 3,
+            global_position: 3,
+            event_type: "Incremented".to_string(),
+            payload: b"null".to_vec(),
+            metadata: serde_json::to_vec(&metadata).expect("metadata to vec"),
+            recorded_at: 1_700_000_000_000,
+        };
+        let store = MockStore::new().with_events(vec![extra_event]);
 
-        // The actor's view should pick up the injected event on next refresh.
+        let handle = spawn_test_actor(store, tmp.path(), "c-catchup").await;
+
         let state = handle.state().await.expect("state should succeed");
         assert_eq!(
-            state.value, 1,
-            "injected Incremented event should bump counter to 1"
+            state.value, 3,
+            "state.value should be 3 after snapshot(2) + 1 Incremented"
         );
-    }
-
-    #[tokio::test]
-    async fn rapid_commands_prevent_idle_eviction() {
-        let tmp = TempDir::new().expect("failed to create temp dir");
-        let config = ActorConfig {
-            idle_timeout: Duration::from_millis(300),
-        };
-        let handle =
-            spawn_actor_with_config::<Counter>(tmp.path(), config).expect("spawn should succeed");
-
-        let ctx = CommandContext::default();
-        // Send commands at 100ms intervals, each resetting the idle timer.
-        for _ in 0..5 {
-            handle
-                .execute(CounterCommand::Increment, ctx.clone())
-                .await
-                .expect("execute should succeed");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        assert!(
-            handle.is_alive(),
-            "actor should still be alive during activity"
-        );
-        let state = handle.state().await.expect("state should succeed");
-        assert_eq!(state.value, 5);
     }
 }

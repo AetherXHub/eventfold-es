@@ -1,84 +1,120 @@
-//! Embedded event-sourcing framework built on top of [`eventfold`].
+//! Event-sourcing framework backed by an `eventfold-db` gRPC server.
 //!
 //! `eventfold-es` provides the building blocks for event-sourced applications:
 //! aggregates, projections, process managers, and a typed command bus. All
-//! state is persisted to disk via `eventfold`'s append-only JSONL logs --
-//! no external database required.
-//!
-//! # Key Types
-//!
-//! | Type | Role |
-//! |------|------|
-//! | [`Aggregate`] | Domain model: handles commands, emits events, folds state |
-//! | [`AggregateStore`] | Central registry: spawns actors, caches handles, runs projections |
-//! | [`Projection`] | Cross-stream read model built from events |
-//! | [`ProcessManager`] | Cross-aggregate workflow that reacts to events with commands |
-//! | [`CommandBus`] | Typed command router keyed by `TypeId` |
-//! | [`AggregateHandle`] | Async handle to a running aggregate actor |
-//!
-//! # Quick Start
-//!
-//! ```no_run
-//! use eventfold_es::{
-//!     Aggregate, AggregateStore, CommandContext,
-//! };
-//! use serde::{Deserialize, Serialize};
-//!
-//! // 1. Define your aggregate.
-//! #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-//! struct Counter { value: u64 }
-//!
-//! #[derive(Debug, Clone, Serialize, Deserialize)]
-//! #[serde(tag = "type", content = "data")]
-//! enum CounterEvent { Incremented }
-//!
-//! #[derive(Debug, thiserror::Error)]
-//! enum CounterError {}
-//!
-//! impl Aggregate for Counter {
-//!     const AGGREGATE_TYPE: &'static str = "counter";
-//!     type Command = String;  // simplified for example
-//!     type DomainEvent = CounterEvent;
-//!     type Error = CounterError;
-//!
-//!     fn handle(&self, _cmd: String) -> Result<Vec<CounterEvent>, CounterError> {
-//!         Ok(vec![CounterEvent::Incremented])
-//!     }
-//!     fn apply(mut self, _event: &CounterEvent) -> Self {
-//!         self.value += 1;
-//!         self
-//!     }
-//! }
-//!
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! // 2. Open the store and send commands.
-//! let store = AggregateStore::open("/tmp/my-app").await?;
-//! let handle = store.get::<Counter>("counter-1").await?;
-//! handle.execute("go".into(), CommandContext::default()).await?;
-//!
-//! let state = handle.state().await?;
-//! assert_eq!(state.value, 1);
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! See `examples/counter.rs` for a self-contained runnable example that
-//! demonstrates aggregates, projections, and the command bus.
+//! state is persisted via a remote `eventfold-db` server over gRPC.
+
+/// Auto-generated protobuf types for the `eventfold` gRPC service.
+pub mod proto {
+    tonic::include_proto!("eventfold");
+}
 
 mod actor;
-pub use actor::{AggregateHandle, spawn_actor};
+pub use actor::AggregateHandle;
 mod aggregate;
-pub use aggregate::{Aggregate, reducer, to_eventfold_event};
+pub use aggregate::Aggregate;
 mod command;
+pub use command::{CommandContext, CommandEnvelope};
 mod error;
-mod process_manager;
-mod projection;
-mod storage;
-mod store;
-
-pub use command::{CommandBus, CommandContext, CommandEnvelope};
 pub use error::{DispatchError, ExecuteError, StateError};
+mod event;
+pub use event::{
+    EventMetadata, ProposedEventData, StoredEvent, decode_stored_event, encode_domain_event,
+    stream_uuid,
+};
+mod client;
+pub use client::{EsClient, ExpectedVersionArg};
+mod process_manager;
+mod snapshot;
+mod storage;
 pub use process_manager::{ProcessManager, ProcessManagerReport};
+mod projection;
+mod store;
 pub use projection::Projection;
-pub use storage::StreamLayout;
 pub use store::{AggregateStore, AggregateStoreBuilder, InjectOptions};
+
+#[cfg(test)]
+mod tests {
+    use super::proto;
+
+    #[test]
+    fn proto_proposed_event_is_accessible() {
+        let event = proto::ProposedEvent {
+            event_id: "test-id".to_string(),
+            event_type: "TestEvent".to_string(),
+            metadata: vec![],
+            payload: vec![],
+        };
+        assert_eq!(event.event_id, "test-id");
+        assert_eq!(event.event_type, "TestEvent");
+    }
+
+    #[test]
+    fn proto_recorded_event_is_accessible() {
+        let event = proto::RecordedEvent {
+            event_id: "evt-1".to_string(),
+            stream_id: "stream-1".to_string(),
+            stream_version: 0,
+            global_position: 42,
+            event_type: "Incremented".to_string(),
+            metadata: vec![],
+            payload: vec![],
+            recorded_at: 1_700_000_000_000,
+        };
+        assert_eq!(event.global_position, 42);
+        assert_eq!(event.recorded_at, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn proto_append_request_is_accessible() {
+        let req = proto::AppendRequest {
+            stream_id: "stream-1".to_string(),
+            expected_version: None,
+            events: vec![],
+        };
+        assert_eq!(req.stream_id, "stream-1");
+        assert!(req.events.is_empty());
+    }
+
+    #[test]
+    fn proto_expected_version_exact_variant() {
+        let ev = proto::ExpectedVersion {
+            kind: Some(proto::expected_version::Kind::Exact(5)),
+        };
+        assert!(matches!(
+            ev.kind,
+            Some(proto::expected_version::Kind::Exact(5))
+        ));
+    }
+
+    #[test]
+    fn proto_subscribe_response_variants() {
+        // Verify the oneof variants are accessible.
+        let caught_up = proto::SubscribeResponse {
+            content: Some(proto::subscribe_response::Content::CaughtUp(
+                proto::Empty {},
+            )),
+        };
+        assert!(matches!(
+            caught_up.content,
+            Some(proto::subscribe_response::Content::CaughtUp(_))
+        ));
+    }
+
+    #[test]
+    fn proto_list_streams_response_is_accessible() {
+        let resp = proto::ListStreamsResponse { streams: vec![] };
+        assert!(resp.streams.is_empty());
+    }
+
+    #[test]
+    fn proto_grpc_client_type_exists() {
+        // Verify the generated gRPC client type is accessible at compile time.
+        // We cannot connect to a server in unit tests, but we can verify
+        // the type exists by referencing it in a const assertion.
+        fn _assert_client_type_exists<T>(_: T) {}
+        // This would fail to compile if the client type doesn't exist.
+        let _: fn(proto::event_store_client::EventStoreClient<tonic::transport::Channel>) =
+            _assert_client_type_exists;
+    }
+}

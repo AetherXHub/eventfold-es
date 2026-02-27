@@ -1,8 +1,12 @@
-//! Self-contained example demonstrating aggregates, projections, and the command bus.
+//! Self-contained example demonstrating aggregates, projections, and the
+//! builder-based `AggregateStoreBuilder` API backed by an `eventfold-db`
+//! gRPC server.
 //!
 //! Run with: `cargo run --example counter`
+//!
+//! **Requires** a running `eventfold-db` server on `http://127.0.0.1:2113`.
 
-use eventfold_es::{Aggregate, AggregateStore, CommandBus, CommandContext, Projection};
+use eventfold_es::{Aggregate, AggregateStoreBuilder, CommandContext, Projection, StoredEvent};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -16,6 +20,7 @@ struct Counter {
 }
 
 /// Commands accepted by the [`Counter`] aggregate.
+#[derive(Clone)]
 enum CounterCommand {
     Increment,
     Decrement,
@@ -94,11 +99,11 @@ struct TotalCounter {
 impl Projection for TotalCounter {
     const NAME: &'static str = "total-counter";
 
-    fn subscriptions(&self) -> &'static [&'static str] {
-        &["counter"]
-    }
-
-    fn apply(&mut self, _aggregate_type: &str, _stream_id: &str, event: &eventfold::Event) {
+    fn apply(&mut self, event: &StoredEvent) {
+        // Only react to "counter" aggregate events.
+        if event.aggregate_type != "counter" {
+            return;
+        }
         match event.event_type.as_str() {
             "Incremented" => self.total_increments += 1,
             "Decremented" => self.total_decrements += 1,
@@ -114,56 +119,56 @@ impl Projection for TotalCounter {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Use a temporary directory so the example is self-contained.
+    // Use a temporary directory for local caches (snapshots, checkpoints).
     let tmp = tempfile::tempdir()?;
 
-    // Build the store with a projection.
-    let store = AggregateStore::builder(tmp.path())
+    // Build the store via the builder API.
+    let store = AggregateStoreBuilder::new()
+        .endpoint("http://127.0.0.1:2113")
+        .base_dir(tmp.path())
         .projection::<TotalCounter>()
         .open()
         .await?;
 
-    // Set up a typed command bus.
-    let mut bus = CommandBus::new(store.clone());
-    bus.register::<Counter>();
-
     let ctx = CommandContext::default().with_actor("example-runner");
 
     // Create two counter instances and send commands.
-    bus.dispatch("alpha", CounterCommand::Increment, ctx.clone())
+    let alpha = store.get::<Counter>("alpha").await?;
+    alpha
+        .execute(CounterCommand::Increment, ctx.clone())
         .await?;
-    bus.dispatch("alpha", CounterCommand::Increment, ctx.clone())
+    alpha
+        .execute(CounterCommand::Increment, ctx.clone())
         .await?;
-    bus.dispatch("alpha", CounterCommand::Increment, ctx.clone())
+    alpha
+        .execute(CounterCommand::Increment, ctx.clone())
         .await?;
 
-    bus.dispatch("beta", CounterCommand::Increment, ctx.clone())
-        .await?;
-    bus.dispatch("beta", CounterCommand::Decrement, ctx.clone())
-        .await?;
-    bus.dispatch("beta", CounterCommand::Increment, ctx.clone())
-        .await?;
+    let beta = store.get::<Counter>("beta").await?;
+    beta.execute(CounterCommand::Increment, ctx.clone()).await?;
+    beta.execute(CounterCommand::Decrement, ctx.clone()).await?;
+    beta.execute(CounterCommand::Increment, ctx.clone()).await?;
 
     // Reset alpha.
-    bus.dispatch("alpha", CounterCommand::Reset, ctx).await?;
+    alpha.execute(CounterCommand::Reset, ctx).await?;
 
     // Query individual aggregate state.
-    let alpha = store.get::<Counter>("alpha").await?.state().await?;
-    let beta = store.get::<Counter>("beta").await?.state().await?;
+    let alpha_state = alpha.state().await?;
+    let beta_state = beta.state().await?;
 
-    println!("alpha = {}", alpha.value);
-    println!("beta  = {}", beta.value);
+    println!("alpha = {}", alpha_state.value);
+    println!("beta  = {}", beta_state.value);
 
     // Query the projection (catches up automatically).
-    let totals = store.projection::<TotalCounter>()?;
+    let totals = store.projection::<TotalCounter>().await?;
     println!(
         "totals: increments={}, decrements={}, resets={}",
         totals.total_increments, totals.total_decrements, totals.total_resets
     );
 
     // Verify expected values.
-    assert_eq!(alpha.value, 0, "alpha should be reset to 0");
-    assert_eq!(beta.value, 1, "beta should be 1 (inc, dec, inc)");
+    assert_eq!(alpha_state.value, 0, "alpha should be reset to 0");
+    assert_eq!(beta_state.value, 1, "beta should be 1 (inc, dec, inc)");
     assert_eq!(totals.total_increments, 5);
     assert_eq!(totals.total_decrements, 1);
     assert_eq!(totals.total_resets, 1);
