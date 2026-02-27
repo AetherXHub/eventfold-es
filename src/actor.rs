@@ -318,7 +318,7 @@ struct ActorContext<S> {
 async fn run_actor<A, S>(
     mut ctx: ActorContext<S>,
     mut state: A,
-    mut stream_version: u64,
+    mut stream_version: Option<u64>,
     mut rx: mpsc::Receiver<ActorMessage<A>>,
 ) where
     A: Aggregate,
@@ -364,16 +364,15 @@ async fn run_actor<A, S>(
                     match result {
                         Ok(_resp) => {
                             // Re-read to update local state after injection.
-                            if let Ok(events) = ctx
-                                .store
-                                .read_stream(ctx.stream_id, stream_version + 1, u64::MAX)
-                                .await
+                            let from = stream_version.map_or(0, |v| v + 1);
+                            if let Ok(events) =
+                                ctx.store.read_stream(ctx.stream_id, from, u64::MAX).await
                             {
                                 for ev in &events {
                                     if let Some(domain_event) = decode_domain_event::<A>(ev) {
                                         state = state.apply(&domain_event);
                                     }
-                                    stream_version = ev.stream_version;
+                                    stream_version = Some(ev.stream_version);
                                 }
                             }
                             let _ = reply.send(Ok(()));
@@ -389,14 +388,19 @@ async fn run_actor<A, S>(
                         &ctx.base_dir,
                         &ctx.instance_id,
                         &state,
-                        stream_version,
+                        stream_version.unwrap_or(0),
                     );
                     break;
                 }
             },
             // Channel closed: all senders dropped.
             Ok(None) => {
-                save_snapshot_quietly::<A>(&ctx.base_dir, &ctx.instance_id, &state, stream_version);
+                save_snapshot_quietly::<A>(
+                    &ctx.base_dir,
+                    &ctx.instance_id,
+                    &state,
+                    stream_version.unwrap_or(0),
+                );
                 break;
             }
             // Idle timeout elapsed.
@@ -405,7 +409,12 @@ async fn run_actor<A, S>(
                     aggregate_type = A::AGGREGATE_TYPE,
                     "actor idle, shutting down"
                 );
-                save_snapshot_quietly::<A>(&ctx.base_dir, &ctx.instance_id, &state, stream_version);
+                save_snapshot_quietly::<A>(
+                    &ctx.base_dir,
+                    &ctx.instance_id,
+                    &state,
+                    stream_version.unwrap_or(0),
+                );
                 break;
             }
         }
@@ -440,7 +449,7 @@ fn save_snapshot_quietly<A: Aggregate>(
 async fn execute_with_retry<A, S>(
     store: &mut S,
     state: &mut A,
-    stream_version: &mut u64,
+    stream_version: &mut Option<u64>,
     stream_id: Uuid,
     instance_id: &str,
     cmd: A::Command,
@@ -473,21 +482,18 @@ where
                 ExecuteError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             })?;
 
-        // 3. Append with Exact(version) for OCC.
-        match store
-            .append(
-                stream_id,
-                ExpectedVersionArg::Exact(*stream_version),
-                proposed,
-            )
-            .await
-        {
+        // 3. Append with OCC: NoStream for new streams, Exact(v) for existing.
+        let expected = match *stream_version {
+            Some(v) => ExpectedVersionArg::Exact(v),
+            None => ExpectedVersionArg::NoStream,
+        };
+        match store.append(stream_id, expected, proposed).await {
             Ok(resp) => {
                 // Success: fold events into local state, advance version.
                 for de in &domain_events {
                     *state = state.clone().apply(de);
                 }
-                *stream_version = resp.last_stream_version;
+                *stream_version = Some(resp.last_stream_version);
                 tracing::info!(count = domain_events.len(), "events appended");
                 return Ok(domain_events);
             }
@@ -498,15 +504,16 @@ where
                     "version conflict, re-reading and retrying"
                 );
                 // Re-read from server to catch up with concurrent writes.
+                let from = stream_version.map_or(0, |v| v + 1);
                 let events = store
-                    .read_stream(stream_id, *stream_version + 1, u64::MAX)
+                    .read_stream(stream_id, from, u64::MAX)
                     .await
                     .map_err(ExecuteError::Transport)?;
                 for ev in &events {
                     if let Some(domain_event) = decode_domain_event::<A>(ev) {
                         *state = state.clone().apply(&domain_event);
                     }
-                    *stream_version = ev.stream_version;
+                    *stream_version = Some(ev.stream_version);
                 }
                 // Loop back and retry the command against updated state.
             }
@@ -579,13 +586,13 @@ where
     // Determine starting state and the version to read from.
     // If a snapshot exists at stream_version N, events 0..=N have been
     // applied, so catch-up starts at N + 1.
-    // If no snapshot exists, start from version 0 (the beginning).
-    let (mut state, mut version, from_version) = match snapshot {
+    // If no snapshot exists, stream_version is None (stream may not exist).
+    let (mut state, mut version, from_version): (A, Option<u64>, u64) = match snapshot {
         Some(snap) => {
             let from = snap.stream_version + 1;
-            (snap.state, snap.stream_version, from)
+            (snap.state, Some(snap.stream_version), from)
         }
-        None => (A::default(), 0, 0),
+        None => (A::default(), None, 0),
     };
 
     let events = store.read_stream(stream_id, from_version, u64::MAX).await?;
@@ -593,7 +600,7 @@ where
         if let Some(domain_event) = decode_domain_event::<A>(ev) {
             state = state.apply(&domain_event);
         }
-        version = ev.stream_version;
+        version = Some(ev.stream_version);
     }
 
     let (tx, rx) = mpsc::channel::<ActorMessage<A>>(32);

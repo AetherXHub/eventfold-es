@@ -659,12 +659,12 @@ mod tests {
     #[tokio::test]
     async fn builder_connect_returns_err_when_no_server() {
         let result = AggregateStoreBuilder::new()
-            .endpoint("http://127.0.0.1:2113")
+            .endpoint("http://127.0.0.1:1")
             .open()
             .await;
         assert!(
             result.is_err(),
-            "open should fail when no server is listening"
+            "open should fail when no server is listening on port 1"
         );
     }
 

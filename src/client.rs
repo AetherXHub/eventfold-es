@@ -183,8 +183,14 @@ impl EsClient {
             max_count,
         };
 
-        let response = self.inner.read_stream(request).await?;
-        Ok(response.into_inner().events)
+        match self.inner.read_stream(request).await {
+            Ok(response) => Ok(response.into_inner().events),
+            // A stream that has never been written to returns NotFound.
+            // Treat this as an empty event list rather than an error,
+            // since actors need to catch up on streams that may not exist yet.
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(Vec::new()),
+            Err(status) => Err(status),
+        }
     }
 
     /// Subscribe to all events in the global log from a given position.
