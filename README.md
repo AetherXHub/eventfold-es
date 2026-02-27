@@ -1,28 +1,33 @@
 # eventfold-es
 
-Embedded event-sourcing framework built on [eventfold](https://crates.io/crates/eventfold).
+Event-sourcing framework backed by [eventfold-db](https://github.com/AetherXHub/eventfold-db), a single-node gRPC event store with global ordering, optimistic concurrency, and push-based subscriptions.
 
-No external database, message broker, or network service required -- all state is persisted to plain files on disk. Designed for single-binary CLIs, local-first desktop applications, embedded devices, and prototypes.
+Designed for multi-process, multi-machine applications that need consistent event sourcing without the operational overhead of a distributed database.
 
 ## Features
 
 - **Aggregates** -- define domain models with command handlers and event applicators
-- **Actor-per-instance** -- each aggregate runs on a dedicated thread with exclusive file lock
-- **Projections** -- cross-stream read models with incremental catch-up and checkpointing
+- **Actor-per-instance** -- each aggregate runs as a tokio task with optimistic concurrency (3x retry)
+- **Projections** -- cross-stream read models via `SubscribeAll` with global cursor checkpointing
 - **Process managers** -- cross-aggregate workflows that react to events with commands
-- **CommandBus** -- typed command routing by `TypeId` (no serialization needed)
+- **Snapshots** -- local file-based snapshots for fast actor recovery without full stream replay
 - **Idle eviction** -- actors shut down after configurable inactivity, re-spawn transparently
 - **Tracing** -- structured instrumentation via the `tracing` crate throughout
+
+## Prerequisites
+
+A running [eventfold-db](https://github.com/AetherXHub/eventfold-db) server. The default endpoint is `http://127.0.0.1:2113`.
 
 ## Quick Start
 
 ```rust
-use eventfold_es::{Aggregate, AggregateStore, CommandBus, CommandContext};
+use eventfold_es::{Aggregate, AggregateStoreBuilder, CommandContext};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Counter { value: u64 }
 
+#[derive(Clone)]
 enum CounterCommand { Increment }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,91 +57,96 @@ impl Aggregate for Counter {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = AggregateStore::open("/tmp/my-app").await?;
+    let store = AggregateStoreBuilder::new()
+        .endpoint("http://127.0.0.1:2113")
+        .base_dir("/tmp/my-app")
+        .open()
+        .await?;
 
-    // Direct handle usage
     let handle = store.get::<Counter>("counter-1").await?;
     handle.execute(CounterCommand::Increment, CommandContext::default()).await?;
     let state = handle.state().await?;
     assert_eq!(state.value, 1);
 
-    // Or use the CommandBus
-    let mut bus = CommandBus::new(store);
-    bus.register::<Counter>();
-    bus.dispatch("counter-2", CounterCommand::Increment, CommandContext::default()).await?;
-
     Ok(())
 }
 ```
 
-See [`examples/counter.rs`](examples/counter.rs) for a full example with projections and multiple instances.
-
-For a real-world example, see [eventfold-crm](https://github.com/AetherXHub/eventfold-crm) -- a Tauri v2 desktop CRM built on eventfold-es with aggregates, projections, process managers, and a React frontend.
+See [`examples/counter.rs`](examples/counter.rs) for a full example with projections, multiple instances, and resets.
 
 ## Core Types
 
 | Type | Role |
 |------|------|
 | [`Aggregate`] | Domain model: handles commands, emits events, folds state |
+| [`AggregateStoreBuilder`] | Fluent builder for configuring the store with endpoint, projections, and PMs |
 | [`AggregateStore`] | Central registry: spawns actors, caches handles, runs projections |
-| [`AggregateStoreBuilder`] | Fluent builder for configuring projections, process managers, and timeouts |
-| [`Projection`] | Cross-stream read model built from events |
+| [`Projection`] | Cross-stream read model built from `StoredEvent`s via `SubscribeAll` |
 | [`ProcessManager`] | Cross-aggregate workflow that reacts to events with commands |
-| [`CommandBus`] | Typed command router keyed by `TypeId` |
 | [`AggregateHandle`] | Async handle to a running aggregate actor |
-| [`CommandContext`] | Cross-cutting metadata (actor identity, correlation ID, extra metadata) |
+| [`StoredEvent`] | Decoded event delivered to projections/PMs with aggregate type, instance ID, and timestamp |
+| [`CommandContext`] | Cross-cutting metadata (actor identity, correlation ID, source device) |
 
 [`Aggregate`]: https://docs.rs/eventfold-es/latest/eventfold_es/trait.Aggregate.html
 [`AggregateStore`]: https://docs.rs/eventfold-es/latest/eventfold_es/struct.AggregateStore.html
 [`AggregateStoreBuilder`]: https://docs.rs/eventfold-es/latest/eventfold_es/struct.AggregateStoreBuilder.html
 [`Projection`]: https://docs.rs/eventfold-es/latest/eventfold_es/trait.Projection.html
 [`ProcessManager`]: https://docs.rs/eventfold-es/latest/eventfold_es/trait.ProcessManager.html
-[`CommandBus`]: https://docs.rs/eventfold-es/latest/eventfold_es/struct.CommandBus.html
 [`AggregateHandle`]: https://docs.rs/eventfold-es/latest/eventfold_es/struct.AggregateHandle.html
+[`StoredEvent`]: https://docs.rs/eventfold-es/latest/eventfold_es/struct.StoredEvent.html
 [`CommandContext`]: https://docs.rs/eventfold-es/latest/eventfold_es/struct.CommandContext.html
 
 ## Architecture
 
 ```
-tokio async world                     blocking OS threads
-=====================                 ====================
-AggregateStore                        Actor (1 per instance)
-  handle cache (Arc<RwLock>)  ----->    EventWriter + View<A>
-AggregateHandle (Clone)                 sequential message loop
-CommandBus                              idle timeout -> exit
-
-ProjectionRunner                      (no dedicated thread)
-ProcessManagerRunner                    blocking I/O under std::sync::Mutex
+                    eventfold-es                          eventfold-db
+                    ============                          ============
+AggregateStoreBuilder                                   gRPC server
+  .endpoint("http://...")                               (global log + streams)
+  .open().await
+       |
+AggregateStore
+  handle cache (Arc<RwLock>)
+       |
+  +----+----+
+  |         |
+Actor       ProjectionRunner / ProcessManagerRunner
+(tokio task)   subscribe_all_from(global_position)
+  |                |
+  EsClient         EsClient
+  .append()        .subscribe_all_from()
+  .read_stream()
+       |                |
+       +--- gRPC -------+---> eventfold-db :2113
 ```
 
-Each aggregate instance runs on a **dedicated blocking thread**, not a tokio task. The actor exclusively owns the `EventWriter` (file lock) and processes commands sequentially. This guarantees single-writer consistency without optimistic concurrency retries.
+Each aggregate instance runs as a **tokio task** (not a blocking thread). The actor owns the in-memory state and processes commands sequentially. Writes use `ExpectedVersion::Exact(v)` for optimistic concurrency with up to 3 automatic retries on conflict.
 
-Idle actors shut down after a configurable timeout (default 5 minutes), releasing their file lock. The next `store.get()` transparently re-spawns the actor and recovers state from disk.
+Projections and process managers consume the **global event log** via `SubscribeAll`, replacing per-stream cursors with a single `global_position` checkpoint.
 
-## Storage Layout
+Idle actors shut down after a configurable timeout (default 5 minutes), saving a local snapshot. The next `store.get()` transparently re-spawns the actor and recovers from the snapshot + any new events.
 
-All data lives under a single base directory:
+## Local Storage Layout
+
+Local caches live under `base_dir` (snapshots and checkpoints only -- events are in eventfold-db):
 
 ```
 <base_dir>/
-    streams/<aggregate_type>/<instance_id>/
-        app.jsonl                   # eventfold append-only event log
-        views/state.snapshot.json   # eventfold view snapshot
+    snapshots/<aggregate_type>/<instance_id>/
+        snapshot.json               # aggregate state + stream version
     projections/<name>/
-        checkpoint.json             # projection state + per-stream cursors
+        checkpoint.json             # projection state + global position
     process_managers/<name>/
-        checkpoint.json             # PM state + per-stream cursors
-        dead_letters.jsonl          # failed dispatches
-    meta/
-        streams.jsonl               # stream registry
+        checkpoint.json             # PM state + global position
+        dead_letters.jsonl          # failed command dispatches
 ```
-
-Event logs are plain JSONL, fully compatible with standard Unix tools and the `eventfold` CLI.
 
 ## Configuration
 
 ```rust
-let store = AggregateStore::builder("/tmp/my-app")
+let store = AggregateStoreBuilder::new()
+    .endpoint("http://127.0.0.1:2113")
+    .base_dir("/tmp/my-app")
     .projection::<MyProjection>()
     .process_manager::<MySaga>()
     .aggregate_type::<TargetAggregate>()  // dispatch target for process managers
@@ -145,10 +155,22 @@ let store = AggregateStore::builder("/tmp/my-app")
     .await?;
 ```
 
+- **`endpoint(url)`** -- eventfold-db gRPC server address
+- **`base_dir(path)`** -- local directory for snapshots and checkpoints
 - **`projection::<P>()`** -- register a read model
 - **`process_manager::<PM>()`** -- register a workflow coordinator
 - **`aggregate_type::<A>()`** -- register a dispatch target (requires `A::Command: DeserializeOwned`)
 - **`idle_timeout(dur)`** -- set actor eviction timeout (default: 5 min)
+
+## Stream ID Mapping
+
+eventfold-db uses UUIDs for stream IDs. eventfold-es derives them deterministically:
+
+```
+stream_uuid("counter", "c-1") = UUID v5(NAMESPACE, "counter/c-1")
+```
+
+The aggregate type and instance ID are also stamped into each event's metadata, making events self-describing without a client-side registry.
 
 ## Domain Event Convention
 
@@ -163,7 +185,7 @@ enum MyEvent {
 }
 ```
 
-This maps cleanly to eventfold's `event_type` + `data` fields.
+The `type` field maps to `event_type` in eventfold-db; `data` becomes the event payload.
 
 ## License
 
