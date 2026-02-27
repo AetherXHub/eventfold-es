@@ -6,7 +6,7 @@ description = "Event-sourcing framework backed by eventfold-db gRPC server"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/aetherxhub/eventfold-es"
 readme = "README.md"
-keywords = ["event-sourcing", "cqrs", "aggregate", "eventfold", "embedded"]
+keywords = ["event-sourcing", "cqrs", "aggregate", "eventfold", "grpc"]
 categories = ["data-structures", "database"]
 # Examples require a running eventfold-db server to execute, but they
 # compile against the library as a build-time check.

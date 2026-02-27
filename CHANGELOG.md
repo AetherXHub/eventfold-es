@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-02-27
+
+### Changed
+
+- **Breaking:** Replaced `eventfold` JSONL file backend with `eventfold-db` gRPC
+  client. All event storage now goes through a remote eventfold-db server.
+- **Breaking:** `AggregateStore::open(base_dir)` replaced by
+  `AggregateStoreBuilder::new().endpoint(url).base_dir(path).open()`.
+- **Breaking:** Removed `CommandBus` and typed command routing. Use
+  `store.get::<A>(id).execute(cmd, ctx)` directly.
+- **Breaking:** `Projection::apply()` and `ProcessManager::react()` now receive
+  `&StoredEvent` instead of `&eventfold::Event`.
+- **Breaking:** `AggregateHandle::reader()` removed (no local event log).
+- Actors are now tokio tasks (not blocking threads) with optimistic concurrency
+  control (3 automatic retries on `WrongExpectedVersion`).
+- Projections and process managers consume the global event log via `SubscribeAll`
+  with `global_position` cursors (replacing per-stream byte-offset cursors).
+- `StreamLayout` narrowed to `pub(crate)` with only snapshot/checkpoint paths.
+
+### Added
+
+- `EsClient` -- typed gRPC client wrapping tonic-generated `EventStoreClient`.
+- `ExpectedVersionArg` enum (Any, NoStream, Exact) for optimistic concurrency.
+- `StoredEvent` struct with aggregate type, instance ID, global position, and
+  server-assigned `recorded_at` timestamp.
+- `EventMetadata` struct for structured event metadata (aggregate type, instance
+  ID, actor, correlation ID, source device).
+- `stream_uuid()` -- deterministic UUID v5 mapping from (aggregate_type,
+  instance_id) to stream ID.
+- `encode_domain_event()` / `decode_stored_event()` for domain event
+  serialization to/from gRPC payloads.
+- `Snapshot<A>` with atomic file-based save/load for fast actor recovery.
+- `EventStoreOps` trait for actor testability without a live gRPC connection.
+- Vendored `proto/eventfold.proto` for crates.io publishing.
+
+### Removed
+
+- `eventfold` crate dependency (JSONL file-based storage).
+- `CommandBus`, `CommandRoute`, `TypedCommandRoute`.
+- `Aggregate::reducer()`, `Aggregate::reduce()`, `to_eventfold_event()`.
+- Per-stream directory hierarchy (`streams/<type>/<id>/app.jsonl`, `views/`).
+- Stream registry file (`meta/streams.jsonl`).
+
+### Dependencies
+
+- Added `tonic` 0.13, `prost` 0.13, `bytes` 1, `tokio-stream` 0.1.
+- Added `uuid` `v5` feature (previously only `v4`).
+- Added `tonic-build` 0.13 as build dependency.
+- Removed `eventfold` 0.2.0.
+
 ## [0.2.0] - 2026-02-22
 
 ### Added
@@ -45,6 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Async support via `tokio`
 - README with API overview, architecture, and usage examples
 
-[Unreleased]: https://github.com/aetherxhub/eventfold-es/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/aetherxhub/eventfold-es/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/aetherxhub/eventfold-es/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/aetherxhub/eventfold-es/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/aetherxhub/eventfold-es/releases/tag/v0.1.0
