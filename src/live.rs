@@ -90,6 +90,9 @@ pub struct LiveHandle {
     pub(crate) shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// Set to `true` when the live loop receives a `CaughtUp` sentinel.
     pub(crate) caught_up: Arc<AtomicBool>,
+    /// Carries the latest global position after each event is processed.
+    /// Initialized to 0. Callers obtain a receiver via [`subscribe`](LiveHandle::subscribe).
+    pub(crate) position_tx: Arc<tokio::sync::watch::Sender<u64>>,
     /// The spawned background task. Wrapped in `Option` so it can be
     /// taken and awaited exactly once by [`shutdown`](LiveHandle::shutdown).
     pub(crate) task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<io::Result<()>>>>>,
@@ -104,6 +107,35 @@ impl LiveHandle {
     /// `true` after the initial catch-up phase completes; `false` before.
     pub fn is_caught_up(&self) -> bool {
         self.caught_up.load(Ordering::Acquire)
+    }
+
+    /// Subscribe to global position updates from the live loop.
+    ///
+    /// Returns a `watch::Receiver<u64>` whose value is updated to the most
+    /// recently processed event's global position after each event is fully
+    /// fanned out to all projections and process managers. The initial value
+    /// is `0`.
+    ///
+    /// # Usage
+    ///
+    /// ```no_run
+    /// # fn example(handle: eventfold_es::LiveHandle) {
+    /// let mut rx = handle.subscribe();
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// loop {
+    ///     rx.changed().await.expect("live loop dropped");
+    ///     let pos = *rx.borrow_and_update();
+    ///     // react to pos
+    /// }
+    /// # });
+    /// # }
+    /// ```
+    ///
+    /// Multiple receivers can be created: each call to `subscribe()` returns an
+    /// independent receiver, and cloning an existing `watch::Receiver` also
+    /// works. All receivers see the same coalesced position value.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.position_tx.subscribe()
     }
 
     /// Signal the live loop to stop and wait for a final checkpoint save.
@@ -222,6 +254,8 @@ async fn min_global_position(store: &AggregateStore) -> u64 {
 /// * `store` - The aggregate store providing client, projections, PMs,
 ///   dispatchers, and configuration.
 /// * `caught_up` - Atomic flag set to `true` when `CaughtUp` is received.
+/// * `position_tx` - Watch sender updated with each event's global position
+///   after full fan-out and PM dispatch.
 /// * `shutdown_rx` - Watch receiver that signals the loop to stop.
 ///
 /// # Returns
@@ -234,6 +268,7 @@ async fn min_global_position(store: &AggregateStore) -> u64 {
 pub(crate) async fn run_live_loop(
     store: AggregateStore,
     caught_up: Arc<AtomicBool>,
+    position_tx: Arc<tokio::sync::watch::Sender<u64>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     let config = store.live_config.clone();
@@ -273,7 +308,7 @@ pub(crate) async fn run_live_loop(
 
         // Process the stream with select! for shutdown and checkpoint.
         let outcome = {
-            let stream_fut = process_stream_with_dispatch(&store, stream, &caught_up);
+            let stream_fut = process_stream_with_dispatch(&store, stream, &caught_up, &position_tx);
             tokio::pin!(stream_fut);
 
             loop {
@@ -336,6 +371,7 @@ async fn process_stream_with_dispatch(
     mut stream: impl tokio_stream::Stream<Item = Result<crate::proto::SubscribeResponse, tonic::Status>>
     + Unpin,
     caught_up: &AtomicBool,
+    position_tx: &tokio::sync::watch::Sender<u64>,
 ) -> io::Result<StreamOutcome> {
     while let Some(result) = stream.next().await {
         let response = match result {
@@ -425,6 +461,11 @@ async fn process_stream_with_dispatch(
                         }
                     }
                 }
+
+                // Notify subscribers of the newly processed position. `send`
+                // on a watch channel only fails if all receivers have been
+                // dropped, which is not an error -- the `let _` discards that.
+                let _ = position_tx.send(recorded.global_position);
             }
             Some(subscribe_response::Content::CaughtUp(_)) => {
                 caught_up.store(true, Ordering::Release);
@@ -459,6 +500,7 @@ mod tests {
         let handle = LiveHandle {
             shutdown_tx,
             caught_up: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            position_tx: Arc::new(tokio::sync::watch::channel(0u64).0),
             task: Arc::new(tokio::sync::Mutex::new(None)),
         };
         let _cloned = handle.clone();
@@ -470,6 +512,7 @@ mod tests {
         let handle = LiveHandle {
             shutdown_tx,
             caught_up: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            position_tx: Arc::new(tokio::sync::watch::channel(0u64).0),
             task: Arc::new(tokio::sync::Mutex::new(None)),
         };
         assert!(!handle.is_caught_up());
@@ -482,6 +525,7 @@ mod tests {
         let handle = LiveHandle {
             shutdown_tx,
             caught_up: caught_up.clone(),
+            position_tx: Arc::new(tokio::sync::watch::channel(0u64).0),
             task: Arc::new(tokio::sync::Mutex::new(None)),
         };
         caught_up.store(true, std::sync::atomic::Ordering::Release);
@@ -494,10 +538,76 @@ mod tests {
         let handle = LiveHandle {
             shutdown_tx,
             caught_up: Arc::new(AtomicBool::new(false)),
+            position_tx: Arc::new(tokio::sync::watch::channel(0u64).0),
             task: Arc::new(tokio::sync::Mutex::new(None)),
         };
         let result = handle.shutdown().await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn subscribe_returns_receiver_with_initial_value_zero() {
+        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+        let (position_tx, _position_rx) = tokio::sync::watch::channel(0u64);
+        let handle = LiveHandle {
+            shutdown_tx,
+            caught_up: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            position_tx: Arc::new(position_tx),
+            task: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+        let rx = handle.subscribe();
+        assert_eq!(*rx.borrow(), 0);
+    }
+
+    #[test]
+    fn subscribe_multiple_times_returns_independent_receivers() {
+        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+        let (position_tx, _position_rx) = tokio::sync::watch::channel(0u64);
+        let position_tx = Arc::new(position_tx);
+        let handle = LiveHandle {
+            shutdown_tx,
+            caught_up: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            position_tx: position_tx.clone(),
+            task: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let mut rx1 = handle.subscribe();
+        let mut rx2 = handle.subscribe();
+
+        // Both start at 0.
+        assert_eq!(*rx1.borrow(), 0);
+        assert_eq!(*rx2.borrow(), 0);
+
+        // Send a position update.
+        position_tx.send(42).expect("send should succeed");
+
+        // Both receivers see the update.
+        assert_eq!(*rx1.borrow_and_update(), 42);
+        assert_eq!(*rx2.borrow_and_update(), 42);
+    }
+
+    #[test]
+    fn subscribe_on_cloned_handle_shares_same_channel() {
+        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+        let (position_tx, _position_rx) = tokio::sync::watch::channel(0u64);
+        let position_tx = Arc::new(position_tx);
+        let handle = LiveHandle {
+            shutdown_tx,
+            caught_up: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            position_tx: position_tx.clone(),
+            task: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+        let cloned = handle.clone();
+
+        // The cloned handle shares the same underlying sender.
+        assert!(Arc::ptr_eq(&handle.position_tx, &cloned.position_tx));
+
+        // Subscribe on the clone and verify it sees updates from the original.
+        let mut rx = cloned.subscribe();
+        assert_eq!(*rx.borrow(), 0);
+
+        handle.position_tx.send(99).expect("send should succeed");
+        assert_eq!(*rx.borrow_and_update(), 99);
     }
 
     #[tokio::test]
@@ -507,6 +617,7 @@ mod tests {
         let handle = LiveHandle {
             shutdown_tx,
             caught_up: Arc::new(AtomicBool::new(false)),
+            position_tx: Arc::new(tokio::sync::watch::channel(0u64).0),
             task: Arc::new(tokio::sync::Mutex::new(Some(task_handle))),
         };
         handle.shutdown().await.expect("first shutdown");
@@ -664,9 +775,14 @@ mod tests {
         ]);
 
         // Process the stream once (no reconnect needed -- stream ends after CaughtUp).
-        process_stream_with_dispatch(&store, stream, &caught_up)
-            .await
-            .expect("should succeed");
+        process_stream_with_dispatch(
+            &store,
+            stream,
+            &caught_up,
+            &tokio::sync::watch::channel(0u64).0,
+        )
+        .await
+        .expect("should succeed");
 
         // Verify caught_up flag was set.
         assert!(caught_up.load(Ordering::Acquire));
@@ -694,9 +810,14 @@ mod tests {
         // a command targeting "target" aggregate (which has no dispatcher).
         let stream = tokio_stream::iter(vec![event_response(0, 0), caught_up_response()]);
 
-        process_stream_with_dispatch(&store, stream, &caught_up)
-            .await
-            .expect("should succeed");
+        process_stream_with_dispatch(
+            &store,
+            stream,
+            &caught_up,
+            &tokio::sync::watch::channel(0u64).0,
+        )
+        .await
+        .expect("should succeed");
 
         // The EchoSaga PM should have produced an envelope targeting "target".
         // Since no dispatcher is registered for "target", it should be
@@ -726,9 +847,14 @@ mod tests {
             event_response(1, 1),
             caught_up_response(),
         ]);
-        process_stream_with_dispatch(&store, stream, &caught_up)
-            .await
-            .expect("should succeed");
+        process_stream_with_dispatch(
+            &store,
+            stream,
+            &caught_up,
+            &tokio::sync::watch::channel(0u64).0,
+        )
+        .await
+        .expect("should succeed");
 
         // Save checkpoints (simulating what shutdown does).
         save_all_checkpoints(&store).await;
@@ -779,9 +905,14 @@ mod tests {
             caught_up_response(),
         ]);
         let caught_up = Arc::new(AtomicBool::new(false));
-        process_stream_with_dispatch(&store, stream, &caught_up)
-            .await
-            .expect("should succeed");
+        process_stream_with_dispatch(
+            &store,
+            stream,
+            &caught_up,
+            &tokio::sync::watch::channel(0u64).0,
+        )
+        .await
+        .expect("should succeed");
 
         // Both projection and PM should have advanced to position 2.
         assert_eq!(min_global_position(&store).await, 2);
@@ -821,9 +952,14 @@ mod tests {
             Err(tonic::Status::internal("connection lost")),
         ]);
 
-        let result = process_stream_with_dispatch(&store, stream, &caught_up)
-            .await
-            .expect("should return Ok(StreamOutcome)");
+        let result = process_stream_with_dispatch(
+            &store,
+            stream,
+            &caught_up,
+            &tokio::sync::watch::channel(0u64).0,
+        )
+        .await
+        .expect("should return Ok(StreamOutcome)");
 
         assert!(
             matches!(result, StreamOutcome::Error(_)),
@@ -844,6 +980,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_stream_sends_position_after_each_event() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = mock_store_with_projection(tmp.path());
+        let caught_up = Arc::new(AtomicBool::new(false));
+        let (position_tx, position_rx) = tokio::sync::watch::channel(0u64);
+
+        // Build a two-event stream followed by CaughtUp.
+        let stream = tokio_stream::iter(vec![
+            event_response(0, 0),
+            event_response(1, 1),
+            caught_up_response(),
+        ]);
+
+        process_stream_with_dispatch(&store, stream, &caught_up, &position_tx)
+            .await
+            .expect("should succeed");
+
+        // The position sender should carry the global_position of the last event.
+        assert_eq!(*position_rx.borrow(), 1);
+    }
+
+    #[tokio::test]
     async fn run_live_loop_shutdown_saves_checkpoints() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let store = mock_store_with_projection(tmp.path());
@@ -852,9 +1010,14 @@ mod tests {
         {
             let caught_up = Arc::new(AtomicBool::new(false));
             let stream = tokio_stream::iter(vec![event_response(0, 0), caught_up_response()]);
-            process_stream_with_dispatch(&store, stream, &caught_up)
-                .await
-                .expect("should succeed");
+            process_stream_with_dispatch(
+                &store,
+                stream,
+                &caught_up,
+                &tokio::sync::watch::channel(0u64).0,
+            )
+            .await
+            .expect("should succeed");
         }
 
         // Create a LiveHandle wrapping a task that just saves checkpoints
@@ -871,6 +1034,7 @@ mod tests {
         let handle = LiveHandle {
             shutdown_tx,
             caught_up: caught_up_flag,
+            position_tx: Arc::new(tokio::sync::watch::channel(0u64).0),
             task: Arc::new(tokio::sync::Mutex::new(Some(task))),
         };
 

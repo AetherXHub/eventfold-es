@@ -535,6 +535,7 @@ mod tests {
     }
 
     /// Build a `SubscribeResponse` wrapping a `RecordedEvent`.
+    #[allow(clippy::result_large_err)]
     fn event_response(
         global_position: u64,
         stream_version: u64,
@@ -548,6 +549,7 @@ mod tests {
     }
 
     /// Build a `SubscribeResponse` with the `CaughtUp` sentinel.
+    #[allow(clippy::result_large_err)]
     fn caught_up_response() -> Result<SubscribeResponse, tonic::Status> {
         Ok(SubscribeResponse {
             content: Some(Content::CaughtUp(Empty {})),

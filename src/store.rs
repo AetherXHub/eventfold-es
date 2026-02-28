@@ -234,18 +234,21 @@ impl AggregateStore {
         }
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (position_tx, _position_rx) = tokio::sync::watch::channel(0u64);
+        let position_tx = Arc::new(position_tx);
         let caught_up = Arc::new(AtomicBool::new(false));
 
         let store_clone = self.clone();
         let caught_up_clone = caught_up.clone();
-        let task =
-            tokio::spawn(
-                async move { run_live_loop(store_clone, caught_up_clone, shutdown_rx).await },
-            );
+        let position_tx_clone = Arc::clone(&position_tx);
+        let task = tokio::spawn(async move {
+            run_live_loop(store_clone, caught_up_clone, position_tx_clone, shutdown_rx).await
+        });
 
         let handle = LiveHandle {
             shutdown_tx,
             caught_up,
+            position_tx,
             task: Arc::new(tokio::sync::Mutex::new(Some(task))),
         };
 
@@ -892,6 +895,7 @@ mod tests {
             let handle = crate::live::LiveHandle {
                 shutdown_tx,
                 caught_up: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                position_tx: Arc::new(tokio::sync::watch::channel(0u64).0),
                 task: Arc::new(tokio::sync::Mutex::new(None)),
             };
             *store.live_handle.lock().await = Some(handle);
@@ -966,6 +970,7 @@ mod tests {
             let handle = crate::live::LiveHandle {
                 shutdown_tx,
                 caught_up: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                position_tx: Arc::new(tokio::sync::watch::channel(0u64).0),
                 task: Arc::new(tokio::sync::Mutex::new(None)),
             };
             *store.live_handle.lock().await = Some(handle);
