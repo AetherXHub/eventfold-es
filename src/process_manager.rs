@@ -320,6 +320,13 @@ fn react_recorded_event<PM: ProcessManager>(
     last_global_position: &mut u64,
     recorded: &proto::RecordedEvent,
 ) -> Vec<CommandEnvelope> {
+    // Skip events already processed. This guards against replay when the live
+    // loop subscribes from min_global_position across multiple process managers
+    // -- PMs ahead of the minimum would otherwise re-react to events.
+    if recorded.global_position < *last_global_position {
+        return Vec::new();
+    }
+
     let next_position = recorded.global_position + 1;
 
     let produced = if let Some(stored) = decode_stored_event(recorded) {
@@ -790,6 +797,47 @@ mod tests {
         // Non-decodable event produces no envelopes but advances position.
         assert!(envelopes.is_empty());
         assert_eq!(catch_up.position(), 4);
+    }
+
+    // --- Replay guard tests ---
+
+    #[test]
+    fn react_recorded_event_skips_already_processed_positions() {
+        // Simulate a PM at position 5 (has processed events 0..5).
+        let mut state = EchoSaga::default();
+        let mut position: u64 = 5;
+
+        // Event at position 3 should be skipped (already processed).
+        let old_event = make_recorded_event(3, 3);
+        let envelopes = react_recorded_event(&mut state, &mut position, &old_event);
+        assert!(
+            envelopes.is_empty(),
+            "should not react to already-processed event"
+        );
+        assert_eq!(state.events_seen, 0, "state should not change");
+        assert_eq!(position, 5, "position should not change");
+
+        // Event at position 5 should be processed (next expected position).
+        let current_event = make_recorded_event(5, 5);
+        let envelopes = react_recorded_event(&mut state, &mut position, &current_event);
+        assert_eq!(
+            envelopes.len(),
+            1,
+            "should react to event at current position"
+        );
+        assert_eq!(state.events_seen, 1);
+        assert_eq!(position, 6, "position should advance");
+
+        // Event at position 10 should also be processed (gap is fine).
+        let future_event = make_recorded_event(10, 10);
+        let envelopes = react_recorded_event(&mut state, &mut position, &future_event);
+        assert_eq!(
+            envelopes.len(),
+            1,
+            "should react to event ahead of position"
+        );
+        assert_eq!(state.events_seen, 2);
+        assert_eq!(position, 11);
     }
 
     // --- Dead-letter tests ---

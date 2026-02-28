@@ -262,6 +262,13 @@ fn apply_recorded_event<P: Projection>(
     last_global_position: &mut u64,
     recorded: &proto::RecordedEvent,
 ) {
+    // Skip events already processed. This guards against replay when the live
+    // loop subscribes from min_global_position across multiple projections --
+    // projections ahead of the minimum would otherwise re-apply events.
+    if recorded.global_position < *last_global_position {
+        return;
+    }
+
     let next_position = recorded.global_position + 1;
 
     if let Some(stored) = decode_stored_event(recorded) {
@@ -670,6 +677,31 @@ mod tests {
             .expect("checkpoint should exist");
         assert_eq!(loaded.state.count, 1);
         assert_eq!(loaded.last_global_position, 1);
+    }
+
+    #[test]
+    fn apply_recorded_event_skips_already_processed_positions() {
+        // Simulate a projection at position 5 (has processed events 0..5).
+        let mut state = EventCounter::default();
+        let mut position: u64 = 5;
+
+        // Event at position 3 should be skipped (already processed).
+        let old_event = make_recorded_event(3, 3);
+        apply_recorded_event(&mut state, &mut position, &old_event);
+        assert_eq!(state.count, 0, "should not apply already-processed event");
+        assert_eq!(position, 5, "position should not change");
+
+        // Event at position 5 should be applied (next expected position).
+        let current_event = make_recorded_event(5, 5);
+        apply_recorded_event(&mut state, &mut position, &current_event);
+        assert_eq!(state.count, 1, "should apply event at current position");
+        assert_eq!(position, 6, "position should advance");
+
+        // Event at position 10 should also be applied (gap is fine).
+        let future_event = make_recorded_event(10, 10);
+        apply_recorded_event(&mut state, &mut position, &future_event);
+        assert_eq!(state.count, 2, "should apply event ahead of position");
+        assert_eq!(position, 11);
     }
 
     #[tokio::test]
