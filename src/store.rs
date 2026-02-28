@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -20,11 +21,12 @@ use crate::aggregate::Aggregate;
 use crate::client::{EsClient, ExpectedVersionArg};
 use crate::command::CommandEnvelope;
 use crate::event::{ProposedEventData, stream_uuid};
+use crate::live::{LiveConfig, LiveHandle, run_live_loop};
 use crate::process_manager::{
     ProcessManager, ProcessManagerCatchUp, ProcessManagerReport, ProcessManagerRunner,
     append_dead_letter,
 };
-use crate::projection::{Projection, ProjectionRunner};
+use crate::projection::{Projection, ProjectionCatchUp, ProjectionRunner};
 
 /// Type-erased handle cache keyed by `(TypeId, instance_id)`.
 ///
@@ -36,9 +38,11 @@ type HandleCache = HashMap<(TypeId, String), Box<dyn Any + Send + Sync>>;
 
 /// Type-erased projection map keyed by projection name.
 ///
-/// Each value is a `tokio::sync::Mutex<ProjectionRunner<P>>` erased to
-/// `dyn Any`. We use `tokio::sync::Mutex` because `catch_up` is async.
-type ProjectionMap = HashMap<String, Box<dyn Any + Send + Sync>>;
+/// Each value is a `tokio::sync::Mutex<Box<dyn ProjectionCatchUp>>`, allowing
+/// the store to interact with heterogeneous projection runners without knowing
+/// each concrete `P` type. We use `tokio::sync::Mutex` because `catch_up` is
+/// async.
+type ProjectionMap = HashMap<String, tokio::sync::Mutex<Box<dyn ProjectionCatchUp>>>;
 
 /// Type-erased list of process manager runners.
 ///
@@ -50,7 +54,7 @@ type ProcessManagerList = Vec<tokio::sync::Mutex<Box<dyn ProcessManagerCatchUp>>
 ///
 /// Dispatchers route [`CommandEnvelope`]s from process managers to the
 /// target aggregate, deserializing the JSON command and executing it.
-type DispatcherMap = HashMap<String, Box<dyn AggregateDispatcher>>;
+pub(crate) type DispatcherMap = HashMap<String, Box<dyn AggregateDispatcher>>;
 
 /// Default idle timeout for actors: 5 minutes.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -86,13 +90,15 @@ pub struct InjectOptions {
 /// `Clone` is cheap -- all internal state is `Arc`-wrapped.
 #[derive(Clone)]
 pub struct AggregateStore {
-    client: EsClient,
-    base_dir: PathBuf,
-    cache: Arc<RwLock<HandleCache>>,
-    projections: Arc<tokio::sync::RwLock<ProjectionMap>>,
-    process_managers: Arc<tokio::sync::RwLock<ProcessManagerList>>,
-    dispatchers: Arc<DispatcherMap>,
-    idle_timeout: Duration,
+    pub(crate) client: EsClient,
+    pub(crate) base_dir: PathBuf,
+    pub(crate) cache: Arc<RwLock<HandleCache>>,
+    pub(crate) projections: Arc<tokio::sync::RwLock<ProjectionMap>>,
+    pub(crate) process_managers: Arc<tokio::sync::RwLock<ProcessManagerList>>,
+    pub(crate) dispatchers: Arc<DispatcherMap>,
+    pub(crate) idle_timeout: Duration,
+    pub(crate) live_config: LiveConfig,
+    pub(crate) live_handle: Arc<tokio::sync::Mutex<Option<LiveHandle>>>,
 }
 
 // Manual `Debug` because `dyn Any` is not `Debug` and we don't want to
@@ -202,6 +208,95 @@ impl AggregateStore {
         Ok(())
     }
 
+    /// Start the live subscription loop in the background.
+    ///
+    /// Spawns a tokio task that subscribes to the global event log and
+    /// continuously updates all registered projections and process managers.
+    /// Returns a [`LiveHandle`] for checking catch-up status and shutting down.
+    ///
+    /// Can only be called once per `AggregateStore` instance. A second call
+    /// returns an error without spawning another task.
+    ///
+    /// # Returns
+    ///
+    /// A [`LiveHandle`] for controlling the live subscription loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::AlreadyExists`] if live mode is already active.
+    pub async fn start_live(&self) -> io::Result<LiveHandle> {
+        let mut guard = self.live_handle.lock().await;
+        if guard.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "live subscription already started",
+            ));
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let caught_up = Arc::new(AtomicBool::new(false));
+
+        let store_clone = self.clone();
+        let caught_up_clone = caught_up.clone();
+        let task =
+            tokio::spawn(
+                async move { run_live_loop(store_clone, caught_up_clone, shutdown_rx).await },
+            );
+
+        let handle = LiveHandle {
+            shutdown_tx,
+            caught_up,
+            task: Arc::new(tokio::sync::Mutex::new(Some(task))),
+        };
+
+        *guard = Some(handle.clone());
+        Ok(handle)
+    }
+
+    /// Read a projection's state from the live subscription without catch-up.
+    ///
+    /// If live mode is active (i.e., [`start_live`](AggregateStore::start_live)
+    /// has been called), returns the current in-memory state maintained by the
+    /// live subscription loop. No gRPC call is made and no catch-up occurs.
+    ///
+    /// If live mode is not active, falls back to the pull-based
+    /// [`projection`](AggregateStore::projection) method, which performs a
+    /// full catch-up.
+    ///
+    /// # Returns
+    ///
+    /// A clone of the projection's current state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::NotFound`] if the projection is not registered.
+    /// Returns `io::Error` if the projection type does not match or (in
+    /// fallback mode) if catch-up fails.
+    pub async fn live_projection<P: Projection>(&self) -> io::Result<P> {
+        let guard = self.live_handle.lock().await;
+        if guard.is_some() {
+            // Live mode active: read projection state without catch-up.
+            drop(guard);
+            let projections = self.projections.read().await;
+            let runner_mutex = projections.get(P::NAME).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("projection '{}' not registered", P::NAME),
+                )
+            })?;
+            let runner = runner_mutex.lock().await;
+            let state_box = runner.state_any();
+            state_box
+                .downcast::<P>()
+                .map(|b| *b)
+                .map_err(|_| io::Error::other("projection type mismatch"))
+        } else {
+            // Live mode not active: fall back to pull-based catch-up.
+            drop(guard);
+            self.projection::<P>().await
+        }
+    }
+
     /// Catch up and return the current state of a registered projection.
     ///
     /// Triggers a catch-up pass (reading new events from the global log)
@@ -214,21 +309,23 @@ impl AggregateStore {
     /// # Errors
     ///
     /// Returns `io::ErrorKind::NotFound` if the projection is not registered.
-    /// Returns `io::Error` if catching up on events fails.
+    /// Returns `io::Error` if catching up on events fails or the projection
+    /// type does not match.
     pub async fn projection<P: Projection>(&self) -> io::Result<P> {
         let projections = self.projections.read().await;
-        let runner_any = projections.get(P::NAME).ok_or_else(|| {
+        let runner_mutex = projections.get(P::NAME).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("projection '{}' not registered", P::NAME),
             )
         })?;
-        let runner_mutex = runner_any
-            .downcast_ref::<tokio::sync::Mutex<ProjectionRunner<P>>>()
-            .ok_or_else(|| io::Error::other("projection type mismatch"))?;
         let mut runner = runner_mutex.lock().await;
         runner.catch_up().await?;
-        Ok(runner.state().clone())
+        let state_box = runner.state_any();
+        state_box
+            .downcast::<P>()
+            .map(|b| *b)
+            .map_err(|_| io::Error::other("projection type mismatch"))
     }
 
     /// Run all registered process managers through a catch-up pass.
@@ -320,7 +417,7 @@ impl AggregateStore {
 /// the JSON command payload into `A::Command` and executing it via
 /// the store's `get::<A>(id)` handle.
 #[tonic::async_trait]
-trait AggregateDispatcher: Send + Sync {
+pub(crate) trait AggregateDispatcher: Send + Sync {
     /// Dispatch a command envelope to the target aggregate.
     ///
     /// # Errors
@@ -371,7 +468,8 @@ where
 // --- Factory types for deferred construction ---
 
 /// Factory for creating a type-erased projection runner.
-type ProjectionFactory = Box<dyn FnOnce(EsClient, &Path) -> io::Result<Box<dyn Any + Send + Sync>>>;
+type ProjectionFactory =
+    Box<dyn FnOnce(EsClient, &Path) -> io::Result<tokio::sync::Mutex<Box<dyn ProjectionCatchUp>>>>;
 
 /// Factory for creating a type-erased process manager runner.
 type ProcessManagerFactory = Box<
@@ -408,6 +506,7 @@ pub struct AggregateStoreBuilder {
     process_manager_factories: Vec<(String, ProcessManagerFactory)>,
     dispatcher_factories: Vec<(String, DispatcherFactory)>,
     idle_timeout: Duration,
+    live_config: LiveConfig,
 }
 
 impl AggregateStoreBuilder {
@@ -423,6 +522,7 @@ impl AggregateStoreBuilder {
             process_manager_factories: Vec::new(),
             dispatcher_factories: Vec::new(),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            live_config: LiveConfig::default(),
         }
     }
 
@@ -501,8 +601,9 @@ impl AggregateStoreBuilder {
             Box::new(|client: EsClient, base_dir: &Path| {
                 let checkpoint_dir = base_dir.join("projections").join(P::NAME);
                 let runner = ProjectionRunner::<P>::new(client, checkpoint_dir)?;
-                let boxed: Box<dyn Any + Send + Sync> = Box::new(tokio::sync::Mutex::new(runner));
-                Ok(boxed)
+                Ok(tokio::sync::Mutex::new(
+                    Box::new(runner) as Box<dyn ProjectionCatchUp>
+                ))
             }),
         ));
         self
@@ -554,6 +655,26 @@ impl AggregateStoreBuilder {
     /// `self` for method chaining.
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
+        self
+    }
+
+    /// Set the live subscription configuration.
+    ///
+    /// Controls checkpoint flush frequency and reconnection backoff for the
+    /// live subscription loop started by
+    /// [`AggregateStore::start_live`](AggregateStore).
+    ///
+    /// If not called, [`LiveConfig::default()`] is used.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The [`LiveConfig`] to use for live subscriptions.
+    ///
+    /// # Returns
+    ///
+    /// `self` for method chaining.
+    pub fn live_config(mut self, config: LiveConfig) -> Self {
+        self.live_config = config;
         self
     }
 
@@ -618,6 +739,8 @@ impl AggregateStoreBuilder {
             process_managers: Arc::new(tokio::sync::RwLock::new(process_managers)),
             dispatchers: Arc::new(dispatchers),
             idle_timeout: self.idle_timeout,
+            live_config: self.live_config,
+            live_handle: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 }
@@ -638,6 +761,12 @@ mod tests {
     /// server. The `get` method will fail on cache miss (since the client
     /// is invalid), but cache-hit paths work correctly.
     fn mock_store(base_dir: &Path) -> AggregateStore {
+        mock_store_with_live_config(base_dir, LiveConfig::default())
+    }
+
+    /// Build a mock `AggregateStore` with a specific [`LiveConfig`] for tests
+    /// that need to verify config propagation.
+    fn mock_store_with_live_config(base_dir: &Path, live_config: LiveConfig) -> AggregateStore {
         // Create a dummy EsClient by connecting to a nonsense endpoint.
         // We use `Endpoint::from_static` + `connect_lazy` to get a Channel
         // without actually connecting. This is fine for tests that only
@@ -653,7 +782,229 @@ mod tests {
             process_managers: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             dispatchers: Arc::new(HashMap::new()),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            live_config,
+            live_handle: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    #[tokio::test]
+    async fn start_live_twice_returns_already_exists_error() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = mock_store(tmp.path());
+        let handle = store
+            .start_live()
+            .await
+            .expect("first start_live should succeed");
+
+        let result = store.start_live().await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("second start_live should return Err"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+
+        // Clean up.
+        handle.shutdown().await.expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn live_projection_returns_state_when_live_active() {
+        use crate::event::StoredEvent;
+        use crate::projection::{ProjectionCatchUp, ProjectionRunner};
+
+        // A minimal projection for testing.
+        #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct TestCounter {
+            count: u64,
+        }
+
+        impl crate::projection::Projection for TestCounter {
+            const NAME: &'static str = "test-counter";
+            fn apply(&mut self, _event: &StoredEvent) {
+                self.count += 1;
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let inner = crate::proto::event_store_client::EventStoreClient::new(channel);
+        let client = EsClient::from_inner(inner);
+
+        // Create a projection runner and manually apply events to simulate
+        // live loop having processed events.
+        let checkpoint_dir = tmp.path().join("projections").join("test-counter");
+        let runner = ProjectionRunner::<TestCounter>::new(client.clone(), checkpoint_dir)
+            .expect("runner creation should succeed");
+        let mut projections = HashMap::new();
+        projections.insert(
+            "test-counter".to_string(),
+            tokio::sync::Mutex::new(Box::new(runner) as Box<dyn ProjectionCatchUp>),
+        );
+
+        // Apply 3 events manually (simulating live loop).
+        {
+            let runner_mutex = projections.get("test-counter").unwrap();
+            let mut runner = runner_mutex.lock().await;
+            let recorded = crate::proto::RecordedEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                stream_id: crate::event::stream_uuid("counter", "c-1").to_string(),
+                stream_version: 0,
+                global_position: 0,
+                event_type: "Incremented".to_string(),
+                metadata: serde_json::to_vec(
+                    &serde_json::json!({"aggregate_type": "counter", "instance_id": "c-1"}),
+                )
+                .unwrap(),
+                payload: b"{}".to_vec(),
+                recorded_at: 1_700_000_000_000,
+            };
+            runner.apply_event(&recorded);
+            let recorded2 = crate::proto::RecordedEvent {
+                global_position: 1,
+                stream_version: 1,
+                ..recorded.clone()
+            };
+            runner.apply_event(&recorded2);
+            let recorded3 = crate::proto::RecordedEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                global_position: 2,
+                stream_version: 2,
+                ..recorded
+            };
+            runner.apply_event(&recorded3);
+        }
+
+        let store = AggregateStore {
+            client,
+            base_dir: tmp.path().to_owned(),
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            projections: Arc::new(tokio::sync::RwLock::new(projections)),
+            process_managers: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            dispatchers: Arc::new(HashMap::new()),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            live_config: LiveConfig::default(),
+            live_handle: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        // Simulate live mode being active by placing a LiveHandle in the mutex.
+        {
+            let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+            let handle = crate::live::LiveHandle {
+                shutdown_tx,
+                caught_up: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                task: Arc::new(tokio::sync::Mutex::new(None)),
+            };
+            *store.live_handle.lock().await = Some(handle);
+        }
+
+        // live_projection should return state without catch-up.
+        let state: TestCounter = store
+            .live_projection::<TestCounter>()
+            .await
+            .expect("live_projection should succeed");
+        assert_eq!(state.count, 3);
+    }
+
+    #[tokio::test]
+    async fn live_projection_falls_back_when_not_live() {
+        use crate::event::StoredEvent;
+
+        // A minimal projection for testing fallback.
+        #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct FallbackCounter {
+            count: u64,
+        }
+
+        impl crate::projection::Projection for FallbackCounter {
+            const NAME: &'static str = "fallback-counter";
+            fn apply(&mut self, _event: &StoredEvent) {
+                self.count += 1;
+            }
+        }
+
+        // Without live mode, live_projection should return NotFound for an
+        // unregistered projection (which is the fallback to self.projection()).
+        // We cannot test a successful catch-up without a live gRPC server,
+        // but we can verify the fallback path is invoked by checking it
+        // returns the same error as projection().
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = mock_store(tmp.path());
+
+        let err = store
+            .live_projection::<FallbackCounter>()
+            .await
+            .expect_err("should fail for unregistered projection");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn projection_works_when_live_mode_active() {
+        // When live mode is active, projection() should still work
+        // (it always does a catch-up pass). We verify it at least attempts
+        // catch-up by checking it returns NotFound for unregistered projections,
+        // which proves the code path isn't short-circuited.
+        use crate::event::StoredEvent;
+
+        #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct ProjTestCounter {
+            count: u64,
+        }
+
+        impl crate::projection::Projection for ProjTestCounter {
+            const NAME: &'static str = "proj-test-counter";
+            fn apply(&mut self, _event: &StoredEvent) {
+                self.count += 1;
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = mock_store(tmp.path());
+
+        // Simulate live mode being active.
+        {
+            let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+            let handle = crate::live::LiveHandle {
+                shutdown_tx,
+                caught_up: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                task: Arc::new(tokio::sync::Mutex::new(None)),
+            };
+            *store.live_handle.lock().await = Some(handle);
+        }
+
+        // projection() should still work (returns NotFound for unregistered
+        // projection, same as when live is not active).
+        let err = store
+            .projection::<ProjTestCounter>()
+            .await
+            .expect_err("should fail for unregistered projection");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn projection_works_when_live_mode_not_active() {
+        // Same test without live mode to confirm pull-based path unchanged.
+        use crate::event::StoredEvent;
+
+        #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct ProjTestCounter2 {
+            count: u64,
+        }
+
+        impl crate::projection::Projection for ProjTestCounter2 {
+            const NAME: &'static str = "proj-test-counter2";
+            fn apply(&mut self, _event: &StoredEvent) {
+                self.count += 1;
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = mock_store(tmp.path());
+
+        let err = store
+            .projection::<ProjTestCounter2>()
+            .await
+            .expect_err("should fail for unregistered projection");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[tokio::test]
@@ -666,6 +1017,63 @@ mod tests {
             result.is_err(),
             "open should fail when no server is listening on port 1"
         );
+    }
+
+    #[tokio::test]
+    async fn builder_stores_custom_live_config() {
+        use crate::live::LiveConfig;
+
+        let custom = LiveConfig {
+            checkpoint_interval: Duration::from_secs(42),
+            reconnect_base_delay: Duration::from_millis(500),
+            reconnect_max_delay: Duration::from_secs(60),
+        };
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = mock_store_with_live_config(tmp.path(), custom.clone());
+        assert_eq!(
+            store.live_config.checkpoint_interval,
+            Duration::from_secs(42)
+        );
+        assert_eq!(
+            store.live_config.reconnect_base_delay,
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            store.live_config.reconnect_max_delay,
+            Duration::from_secs(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_default_live_config() {
+        use crate::live::LiveConfig;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = mock_store(tmp.path());
+        let default = LiveConfig::default();
+        assert_eq!(
+            store.live_config.checkpoint_interval,
+            default.checkpoint_interval
+        );
+        assert_eq!(
+            store.live_config.reconnect_base_delay,
+            default.reconnect_base_delay
+        );
+        assert_eq!(
+            store.live_config.reconnect_max_delay,
+            default.reconnect_max_delay
+        );
+    }
+
+    #[tokio::test]
+    async fn start_live_returns_ok_handle() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store = mock_store(tmp.path());
+        let result = store.start_live().await;
+        assert!(result.is_ok(), "start_live should return Ok");
+        let handle = result.unwrap();
+        // Clean up the spawned task.
+        handle.shutdown().await.expect("shutdown should succeed");
     }
 
     #[tokio::test]

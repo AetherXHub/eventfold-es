@@ -5,8 +5,11 @@
 //! cursor position instead of per-stream byte offsets, simplifying
 //! catch-up and checkpointing.
 
+use std::any::Any;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -169,6 +172,7 @@ impl<P: Projection> ProjectionRunner<P> {
     }
 
     /// Returns the current projection state.
+    #[allow(dead_code)] // Superseded by ProjectionCatchUp::state_any for store access.
     pub(crate) fn state(&self) -> &P {
         &self.checkpoint.state
     }
@@ -218,7 +222,7 @@ impl<P: Projection> ProjectionRunner<P> {
         mut stream: impl tokio_stream::Stream<Item = Result<proto::SubscribeResponse, tonic::Status>>
         + Unpin,
     ) -> io::Result<()> {
-        let _span = tracing::debug_span!("projection_catchup", projection_name = P::NAME).entered();
+        tracing::debug!(projection_name = P::NAME, "starting projection catch-up");
 
         while let Some(result) = stream.next().await {
             let response =
@@ -226,20 +230,11 @@ impl<P: Projection> ProjectionRunner<P> {
 
             match response.content {
                 Some(subscribe_response::Content::Event(recorded)) => {
-                    // Record the global position for cursor advancement regardless
-                    // of whether decoding succeeds, so we skip past non-ES events.
-                    let next_position = recorded.global_position + 1;
-
-                    if let Some(stored) = decode_stored_event(&recorded) {
-                        checkpoint.state.apply(&stored);
-                        tracing::debug!(
-                            global_position = stored.global_position,
-                            event_type = %stored.event_type,
-                            "event applied"
-                        );
-                    }
-
-                    checkpoint.last_global_position = next_position;
+                    apply_recorded_event(
+                        &mut checkpoint.state,
+                        &mut checkpoint.last_global_position,
+                        &recorded,
+                    );
                 }
                 Some(subscribe_response::Content::CaughtUp(_)) => {
                     tracing::debug!("caught up");
@@ -252,6 +247,94 @@ impl<P: Projection> ProjectionRunner<P> {
         }
 
         Ok(())
+    }
+}
+
+/// Decode a single [`proto::RecordedEvent`] and apply it to a projection's state,
+/// advancing the checkpoint position.
+///
+/// This helper is shared between [`ProjectionRunner::process_stream`] (batch
+/// catch-up) and [`ProjectionCatchUp::apply_event`] (single-event live mode).
+/// Events that cannot be decoded (missing metadata, invalid UUIDs, etc.) are
+/// silently skipped, but the position always advances.
+fn apply_recorded_event<P: Projection>(
+    state: &mut P,
+    last_global_position: &mut u64,
+    recorded: &proto::RecordedEvent,
+) {
+    let next_position = recorded.global_position + 1;
+
+    if let Some(stored) = decode_stored_event(recorded) {
+        state.apply(&stored);
+        tracing::debug!(
+            global_position = stored.global_position,
+            event_type = %stored.event_type,
+            "event applied"
+        );
+    }
+
+    *last_global_position = next_position;
+}
+
+// --- Type-erased trait for store integration ---
+
+/// Type-erased interface for projection runners.
+///
+/// Allows the live subscription loop and `AggregateStore` to interact with
+/// heterogeneous projections without knowing each concrete `P` type. All
+/// async methods use boxed futures for trait-object compatibility.
+pub(crate) trait ProjectionCatchUp: Send + Sync {
+    /// Catch up on the global event log by subscribing from the current
+    /// checkpoint position.
+    fn catch_up(&mut self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>>;
+
+    /// Decode and apply a single recorded event, advancing the checkpoint
+    /// position.
+    ///
+    /// Used by the live subscription loop to process events one at a time
+    /// rather than draining a full stream.
+    fn apply_event(&mut self, recorded: &proto::RecordedEvent);
+
+    /// Returns the current global cursor position (resume token).
+    fn position(&self) -> u64;
+
+    /// Persist the current checkpoint to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::Error` if writing the checkpoint fails.
+    fn save(&self) -> io::Result<()>;
+
+    /// Clone the current projection state into a type-erased box.
+    ///
+    /// The caller can downcast the returned `Box<dyn Any>` to the concrete
+    /// projection type `P` to read the state.
+    fn state_any(&self) -> Box<dyn Any + Send>;
+}
+
+impl<P: Projection> ProjectionCatchUp for ProjectionRunner<P> {
+    fn catch_up(&mut self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+        Box::pin(self.catch_up())
+    }
+
+    fn apply_event(&mut self, recorded: &proto::RecordedEvent) {
+        apply_recorded_event(
+            &mut self.checkpoint.state,
+            &mut self.checkpoint.last_global_position,
+            recorded,
+        );
+    }
+
+    fn position(&self) -> u64 {
+        self.checkpoint.last_global_position
+    }
+
+    fn save(&self) -> io::Result<()> {
+        save_checkpoint::<P>(&self.checkpoint_dir, &self.checkpoint)
+    }
+
+    fn state_any(&self) -> Box<dyn Any + Send> {
+        Box::new(self.checkpoint.state.clone())
     }
 }
 
@@ -489,6 +572,102 @@ mod tests {
         assert_eq!(checkpoint.state.count, 0);
         // But position should still advance past the skipped event.
         assert_eq!(checkpoint.last_global_position, 6);
+    }
+
+    #[tokio::test]
+    async fn projection_catch_up_apply_event_decodes_and_advances_position() {
+        let dir = tempfile::tempdir().expect("failed to create tmpdir");
+        let checkpoint_dir = dir.path().join("event-counter");
+        std::fs::create_dir_all(&checkpoint_dir).expect("create dir");
+
+        let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let inner = crate::proto::event_store_client::EventStoreClient::new(channel);
+        let client = crate::client::EsClient::from_inner(inner);
+
+        let mut runner = ProjectionRunner::<EventCounter>::new(client, checkpoint_dir)
+            .expect("runner creation should succeed");
+
+        let recorded = make_recorded_event(5, 0);
+        let catch_up: &mut dyn ProjectionCatchUp = &mut runner;
+        catch_up.apply_event(&recorded);
+
+        assert_eq!(catch_up.position(), 6);
+        // Downcast state to verify count incremented.
+        let state_box = catch_up.state_any();
+        let state = state_box
+            .downcast::<EventCounter>()
+            .expect("downcast should succeed");
+        assert_eq!(state.count, 1);
+    }
+
+    #[tokio::test]
+    async fn projection_catch_up_position_starts_at_zero() {
+        let dir = tempfile::tempdir().expect("failed to create tmpdir");
+        let checkpoint_dir = dir.path().join("event-counter");
+        std::fs::create_dir_all(&checkpoint_dir).expect("create dir");
+
+        let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let inner = crate::proto::event_store_client::EventStoreClient::new(channel);
+        let client = crate::client::EsClient::from_inner(inner);
+
+        let runner = ProjectionRunner::<EventCounter>::new(client, checkpoint_dir)
+            .expect("runner creation should succeed");
+
+        let catch_up: &dyn ProjectionCatchUp = &runner;
+        assert_eq!(catch_up.position(), 0);
+    }
+
+    #[tokio::test]
+    async fn projection_catch_up_state_any_returns_cloned_state() {
+        let dir = tempfile::tempdir().expect("failed to create tmpdir");
+        let checkpoint_dir = dir.path().join("event-counter");
+        std::fs::create_dir_all(&checkpoint_dir).expect("create dir");
+
+        let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let inner = crate::proto::event_store_client::EventStoreClient::new(channel);
+        let client = crate::client::EsClient::from_inner(inner);
+
+        let mut runner = ProjectionRunner::<EventCounter>::new(client, checkpoint_dir)
+            .expect("runner creation should succeed");
+
+        // Apply two events, then check state_any returns the updated state.
+        let recorded = make_recorded_event(0, 0);
+        let catch_up: &mut dyn ProjectionCatchUp = &mut runner;
+        catch_up.apply_event(&recorded);
+        let recorded = make_recorded_event(1, 1);
+        catch_up.apply_event(&recorded);
+
+        let state_box = catch_up.state_any();
+        let state = state_box
+            .downcast::<EventCounter>()
+            .expect("downcast should succeed");
+        assert_eq!(state.count, 2);
+    }
+
+    #[tokio::test]
+    async fn projection_catch_up_save_persists_checkpoint() {
+        let dir = tempfile::tempdir().expect("failed to create tmpdir");
+        let checkpoint_dir = dir.path().join("event-counter");
+        std::fs::create_dir_all(&checkpoint_dir).expect("create dir");
+
+        let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let inner = crate::proto::event_store_client::EventStoreClient::new(channel);
+        let client = crate::client::EsClient::from_inner(inner);
+
+        let mut runner = ProjectionRunner::<EventCounter>::new(client, checkpoint_dir.clone())
+            .expect("runner creation should succeed");
+
+        let recorded = make_recorded_event(0, 0);
+        let catch_up: &mut dyn ProjectionCatchUp = &mut runner;
+        catch_up.apply_event(&recorded);
+        catch_up.save().expect("save should succeed");
+
+        // Load and verify checkpoint was saved.
+        let loaded: ProjectionCheckpoint<EventCounter> = load_checkpoint(&checkpoint_dir)
+            .expect("load should succeed")
+            .expect("checkpoint should exist");
+        assert_eq!(loaded.state.count, 1);
+        assert_eq!(loaded.last_global_position, 1);
     }
 
     #[tokio::test]

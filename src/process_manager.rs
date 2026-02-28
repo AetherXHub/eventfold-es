@@ -264,22 +264,12 @@ impl<PM: ProcessManager> ProcessManagerRunner<PM> {
 
             match response.content {
                 Some(subscribe_response::Content::Event(recorded)) => {
-                    // Record the global position for cursor advancement regardless
-                    // of whether decoding succeeds, so we skip past non-ES events.
-                    let next_position = recorded.global_position + 1;
-
-                    if let Some(stored) = decode_stored_event(&recorded) {
-                        let produced = checkpoint.state.react(&stored);
-                        envelopes.extend(produced);
-                        tracing::debug!(
-                            global_position = stored.global_position,
-                            event_type = %stored.event_type,
-                            envelopes_produced = envelopes.len(),
-                            "event reacted"
-                        );
-                    }
-
-                    checkpoint.last_global_position = next_position;
+                    let produced = react_recorded_event(
+                        &mut checkpoint.state,
+                        &mut checkpoint.last_global_position,
+                        &recorded,
+                    );
+                    envelopes.extend(produced);
                 }
                 Some(subscribe_response::Content::CaughtUp(_)) => {
                     tracing::debug!("caught up");
@@ -318,13 +308,44 @@ impl<PM: ProcessManager> ProcessManagerRunner<PM> {
     }
 }
 
+/// Decode a single [`proto::RecordedEvent`] and react to it with a process
+/// manager, advancing the checkpoint position.
+///
+/// This helper is shared between [`ProcessManagerRunner::process_stream`]
+/// (batch catch-up) and [`ProcessManagerCatchUp::react_event`] (single-event
+/// live mode). Events that cannot be decoded are silently skipped, but the
+/// position always advances.
+fn react_recorded_event<PM: ProcessManager>(
+    state: &mut PM,
+    last_global_position: &mut u64,
+    recorded: &proto::RecordedEvent,
+) -> Vec<CommandEnvelope> {
+    let next_position = recorded.global_position + 1;
+
+    let produced = if let Some(stored) = decode_stored_event(recorded) {
+        let envelopes = state.react(&stored);
+        tracing::debug!(
+            global_position = stored.global_position,
+            event_type = %stored.event_type,
+            envelopes_produced = envelopes.len(),
+            "event reacted"
+        );
+        envelopes
+    } else {
+        Vec::new()
+    };
+
+    *last_global_position = next_position;
+    produced
+}
+
 // --- Type-erased trait for store integration ---
 
 /// Trait object interface for process manager runners.
 ///
-/// Allows `run_process_managers` to iterate over heterogeneous process
-/// managers without knowing each concrete `PM` type. All methods are
-/// async-compatible via boxed futures.
+/// Allows `run_process_managers` and the live subscription loop to iterate
+/// over heterogeneous process managers without knowing each concrete `PM`
+/// type. All async methods use boxed futures for trait-object compatibility.
 pub(crate) trait ProcessManagerCatchUp: Send + Sync {
     /// Catch up on the global event log and return command envelopes.
     ///
@@ -335,11 +356,21 @@ pub(crate) trait ProcessManagerCatchUp: Send + Sync {
         Box<dyn std::future::Future<Output = io::Result<Vec<CommandEnvelope>>> + Send + '_>,
     >;
 
+    /// Decode and react to a single recorded event, advancing the checkpoint
+    /// position.
+    ///
+    /// Used by the live subscription loop to process events one at a time
+    /// rather than draining a full stream. Returns any command envelopes
+    /// produced by the process manager.
+    fn react_event(&mut self, recorded: &proto::RecordedEvent) -> Vec<CommandEnvelope>;
+
+    /// Returns the current global cursor position (resume token).
+    fn position(&self) -> u64;
+
     /// Persist the checkpoint to disk.
     fn save(&self) -> io::Result<()>;
 
     /// Returns the process manager name.
-    #[allow(dead_code)] // API surface for logging/diagnostics during dispatch.
     fn name(&self) -> &str;
 
     /// Returns the path to the dead-letter log file.
@@ -353,6 +384,18 @@ impl<PM: ProcessManager> ProcessManagerCatchUp for ProcessManagerRunner<PM> {
         Box<dyn std::future::Future<Output = io::Result<Vec<CommandEnvelope>>> + Send + '_>,
     > {
         Box::pin(self.catch_up())
+    }
+
+    fn react_event(&mut self, recorded: &proto::RecordedEvent) -> Vec<CommandEnvelope> {
+        react_recorded_event(
+            &mut self.checkpoint.state,
+            &mut self.checkpoint.last_global_position,
+            recorded,
+        )
+    }
+
+    fn position(&self) -> u64 {
+        self.checkpoint.last_global_position
     }
 
     fn save(&self) -> io::Result<()> {
@@ -671,6 +714,80 @@ mod tests {
         assert_eq!(checkpoint.state.events_seen, 0);
         // But position should still advance past the skipped event.
         assert_eq!(checkpoint.last_global_position, 6);
+    }
+
+    // --- ProcessManagerCatchUp trait method tests ---
+
+    #[tokio::test]
+    async fn pm_catch_up_react_event_decodes_and_advances_position() {
+        let dir = tempfile::tempdir().expect("failed to create tmpdir");
+        let checkpoint_dir = dir.path().join("echo-saga");
+        std::fs::create_dir_all(&checkpoint_dir).expect("create dir");
+
+        let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let inner = crate::proto::event_store_client::EventStoreClient::new(channel);
+        let client = crate::client::EsClient::from_inner(inner);
+
+        let mut runner = ProcessManagerRunner::<EchoSaga>::new(client, checkpoint_dir)
+            .expect("runner creation should succeed");
+
+        let recorded = make_recorded_event(5, 0);
+        let catch_up: &mut dyn ProcessManagerCatchUp = &mut runner;
+        let envelopes = catch_up.react_event(&recorded);
+
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].aggregate_type, "target");
+        assert_eq!(catch_up.position(), 6);
+    }
+
+    #[tokio::test]
+    async fn pm_catch_up_position_starts_at_zero() {
+        let dir = tempfile::tempdir().expect("failed to create tmpdir");
+        let checkpoint_dir = dir.path().join("echo-saga");
+        std::fs::create_dir_all(&checkpoint_dir).expect("create dir");
+
+        let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let inner = crate::proto::event_store_client::EventStoreClient::new(channel);
+        let client = crate::client::EsClient::from_inner(inner);
+
+        let runner = ProcessManagerRunner::<EchoSaga>::new(client, checkpoint_dir)
+            .expect("runner creation should succeed");
+
+        let catch_up: &dyn ProcessManagerCatchUp = &runner;
+        assert_eq!(catch_up.position(), 0);
+    }
+
+    #[tokio::test]
+    async fn pm_catch_up_react_event_skips_non_es_events() {
+        let dir = tempfile::tempdir().expect("failed to create tmpdir");
+        let checkpoint_dir = dir.path().join("echo-saga");
+        std::fs::create_dir_all(&checkpoint_dir).expect("create dir");
+
+        let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let inner = crate::proto::event_store_client::EventStoreClient::new(channel);
+        let client = crate::client::EsClient::from_inner(inner);
+
+        let mut runner = ProcessManagerRunner::<EchoSaga>::new(client, checkpoint_dir)
+            .expect("runner creation should succeed");
+
+        // RecordedEvent with empty metadata -- cannot be decoded.
+        let recorded = RecordedEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            stream_id: uuid::Uuid::new_v4().to_string(),
+            stream_version: 0,
+            global_position: 3,
+            event_type: "SomeEvent".to_string(),
+            metadata: b"{}".to_vec(),
+            payload: b"{}".to_vec(),
+            recorded_at: 1_700_000_000_000,
+        };
+
+        let catch_up: &mut dyn ProcessManagerCatchUp = &mut runner;
+        let envelopes = catch_up.react_event(&recorded);
+
+        // Non-decodable event produces no envelopes but advances position.
+        assert!(envelopes.is_empty());
+        assert_eq!(catch_up.position(), 4);
     }
 
     // --- Dead-letter tests ---

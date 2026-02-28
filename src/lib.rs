@@ -28,6 +28,8 @@ mod process_manager;
 mod snapshot;
 mod storage;
 pub use process_manager::{ProcessManager, ProcessManagerReport};
+mod live;
+pub use live::{LiveConfig, LiveHandle};
 mod projection;
 mod store;
 pub use projection::Projection;
