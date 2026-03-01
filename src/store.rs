@@ -505,6 +505,7 @@ type DispatcherFactory = Box<dyn FnOnce() -> Box<dyn AggregateDispatcher>>;
 pub struct AggregateStoreBuilder {
     endpoint: Option<String>,
     base_dir: Option<PathBuf>,
+    auth_token: Option<Arc<std::sync::RwLock<String>>>,
     projection_factories: Vec<(String, ProjectionFactory)>,
     process_manager_factories: Vec<(String, ProcessManagerFactory)>,
     dispatcher_factories: Vec<(String, DispatcherFactory)>,
@@ -521,6 +522,7 @@ impl AggregateStoreBuilder {
         Self {
             endpoint: None,
             base_dir: None,
+            auth_token: None,
             projection_factories: Vec::new(),
             process_manager_factories: Vec::new(),
             dispatcher_factories: Vec::new(),
@@ -541,6 +543,30 @@ impl AggregateStoreBuilder {
     /// `self` for method chaining.
     pub fn endpoint(mut self, url: impl Into<String>) -> Self {
         self.endpoint = Some(url.into());
+        self
+    }
+
+    /// Set a shared Bearer token for authenticated gRPC connections.
+    ///
+    /// The token is wrapped in an `Arc<RwLock<String>>` so that callers can
+    /// refresh the token in-place at runtime. The [`BearerInterceptor`]
+    /// reads the lock on every outgoing RPC, so writing a new value into
+    /// the lock is sufficient to rotate credentials without reconnecting.
+    ///
+    /// If the token string is empty, no `Authorization` header is sent,
+    /// effectively behaving as an unauthenticated connection.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - Shared, refreshable Bearer token string.
+    ///
+    /// # Returns
+    ///
+    /// `self` for method chaining.
+    ///
+    /// [`BearerInterceptor`]: crate::auth::BearerInterceptor
+    pub fn auth_token(mut self, token: Arc<std::sync::RwLock<String>>) -> Self {
+        self.auth_token = Some(token);
         self
     }
 
@@ -699,7 +725,10 @@ impl AggregateStoreBuilder {
     pub async fn open(self) -> Result<AggregateStore, tonic::transport::Error> {
         let endpoint = self.endpoint.as_deref().unwrap_or("http://127.0.0.1:2113");
 
-        let client = EsClient::connect(endpoint).await?;
+        let client = match self.auth_token {
+            Some(token) => EsClient::connect_with_token(endpoint, token).await?,
+            None => EsClient::connect(endpoint).await?,
+        };
 
         let base_dir = self
             .base_dir
@@ -1079,6 +1108,25 @@ mod tests {
         let handle = result.unwrap();
         // Clean up the spawned task.
         handle.shutdown().await.expect("shutdown should succeed");
+    }
+
+    #[test]
+    fn builder_without_auth_token_has_none() {
+        let builder = AggregateStoreBuilder::new();
+        assert!(
+            builder.auth_token.is_none(),
+            "auth_token should be None by default"
+        );
+    }
+
+    #[test]
+    fn builder_with_auth_token_has_some() {
+        let token = Arc::new(std::sync::RwLock::new("tok".to_string()));
+        let builder = AggregateStoreBuilder::new().auth_token(token);
+        assert!(
+            builder.auth_token.is_some(),
+            "auth_token should be Some after calling .auth_token()"
+        );
     }
 
     #[tokio::test]

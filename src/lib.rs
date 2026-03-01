@@ -12,6 +12,7 @@ pub mod proto {
 mod actor;
 pub use actor::AggregateHandle;
 mod aggregate;
+mod auth;
 pub use aggregate::Aggregate;
 mod command;
 pub use command::{CommandContext, CommandEnvelope};

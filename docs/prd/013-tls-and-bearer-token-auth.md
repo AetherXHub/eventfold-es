@@ -1,6 +1,6 @@
 # PRD 013: TLS and Bearer Token Authentication
 
-**Status:** DRAFT
+**Status:** TICKETS READY
 **Created:** 2026-02-28
 **Author:** PRD Writer Agent
 **GitHub Issue:** #7

@@ -1,6 +1,6 @@
 [package]
 name = "eventfold-es"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 description = "Event-sourcing framework backed by eventfold-db gRPC server"
 license = "MIT OR Apache-2.0"
@@ -11,6 +11,10 @@ categories = ["data-structures", "database"]
 # Examples require a running eventfold-db server to execute, but they
 # compile against the library as a build-time check.
 autoexamples = true
+
+[features]
+default = []
+tls = ["tonic/tls-native-roots"]
 
 [lib]
 

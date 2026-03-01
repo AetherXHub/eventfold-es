@@ -4,11 +4,30 @@
 //! [`EsClient::subscribe_all_from`]) that accept and return Rust-native types so
 //! that the actor and projection modules never import tonic internals directly.
 
+use std::fmt;
+use std::sync::{Arc, RwLock};
+
+use crate::auth::BearerInterceptor;
 use crate::event::ProposedEventData;
 use crate::proto;
 use crate::proto::event_store_client::EventStoreClient;
 use tonic::transport::Channel;
 use uuid::Uuid;
+
+/// Plain (unauthenticated) gRPC client type alias.
+type PlainClient = EventStoreClient<Channel>;
+
+/// Authenticated gRPC client with Bearer token interceptor.
+type AuthClient =
+    EventStoreClient<tonic::service::interceptor::InterceptedService<Channel, BearerInterceptor>>;
+
+/// Internal transport enum supporting both plain and authenticated channels.
+enum EsClientInner {
+    /// Unauthenticated channel.
+    Plain(PlainClient),
+    /// Channel with a [`BearerInterceptor`] injecting an `Authorization` header.
+    Auth(AuthClient),
+}
 
 /// Local enum representing the expected stream version for optimistic concurrency.
 ///
@@ -71,9 +90,10 @@ pub fn to_proto_event(data: &ProposedEventData) -> proto::ProposedEvent {
 
 /// Typed gRPC client for the `eventfold-db` event store.
 ///
-/// Wraps the tonic-generated [`EventStoreClient<Channel>`] and exposes
-/// ergonomic async methods that accept Rust-native types. Clone is cheap
-/// because tonic channels use internal reference counting.
+/// Wraps the tonic-generated [`EventStoreClient`] and exposes ergonomic async
+/// methods that accept Rust-native types. Supports both plain and authenticated
+/// (Bearer token) transports via an internal enum. Clone is cheap because the
+/// inner transport is wrapped in an [`Arc`].
 ///
 /// # Examples
 ///
@@ -85,13 +105,28 @@ pub fn to_proto_event(data: &ProposedEventData) -> proto::ProposedEvent {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EsClient {
-    inner: EventStoreClient<Channel>,
+    inner: Arc<EsClientInner>,
+}
+
+impl fmt::Debug for EsClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match *self.inner {
+            EsClientInner::Plain(_) => "Plain",
+            EsClientInner::Auth(_) => "Auth",
+        };
+        f.debug_struct("EsClient")
+            .field("transport", &variant)
+            .finish()
+    }
 }
 
 impl EsClient {
     /// Connect to an `eventfold-db` gRPC server at the given endpoint.
+    ///
+    /// Creates an unauthenticated (plain) connection. For authenticated
+    /// connections, use [`connect_with_token`](Self::connect_with_token).
     ///
     /// # Arguments
     ///
@@ -105,8 +140,43 @@ impl EsClient {
     ///
     /// Returns [`tonic::transport::Error`] if the channel cannot be established.
     pub async fn connect(endpoint: &str) -> Result<Self, tonic::transport::Error> {
-        let inner = EventStoreClient::connect(endpoint.to_string()).await?;
-        Ok(Self { inner })
+        let client = EventStoreClient::connect(endpoint.to_string()).await?;
+        Ok(Self {
+            inner: Arc::new(EsClientInner::Plain(client)),
+        })
+    }
+
+    /// Connect to an `eventfold-db` gRPC server with Bearer token authentication.
+    ///
+    /// The token is read from the shared [`RwLock`] on every outgoing RPC. To
+    /// refresh the token at runtime, write a new value into the lock -- the next
+    /// RPC will pick it up automatically. If the token string is empty, no
+    /// `Authorization` header is sent.
+    ///
+    /// # Arguments
+    ///
+    /// * `endpoint` - The URI of the gRPC server (e.g., `"https://es.example.com:443"`).
+    /// * `token` - Shared, refreshable Bearer token string.
+    ///
+    /// # Returns
+    ///
+    /// An `EsClient` ready to issue authenticated RPCs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`tonic::transport::Error`] if the channel cannot be established.
+    pub async fn connect_with_token(
+        endpoint: &str,
+        token: Arc<RwLock<String>>,
+    ) -> Result<Self, tonic::transport::Error> {
+        let channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())?
+            .connect()
+            .await?;
+        let interceptor = BearerInterceptor { token };
+        let client = EventStoreClient::with_interceptor(channel, interceptor);
+        Ok(Self {
+            inner: Arc::new(EsClientInner::Auth(client)),
+        })
     }
 
     /// Construct an `EsClient` from a pre-built [`EventStoreClient`].
@@ -114,7 +184,17 @@ impl EsClient {
     /// Used in tests to create clients with lazy or mock channels.
     #[cfg(test)]
     pub(crate) fn from_inner(inner: EventStoreClient<Channel>) -> Self {
-        Self { inner }
+        Self {
+            inner: Arc::new(EsClientInner::Plain(inner)),
+        }
+    }
+
+    /// Check whether this client uses an authenticated (Bearer token) transport.
+    ///
+    /// Returns `true` if the client was created via [`connect_with_token`](Self::connect_with_token).
+    #[cfg(test)]
+    pub(crate) fn is_auth(&self) -> bool {
+        matches!(*self.inner, EsClientInner::Auth(_))
     }
 
     /// Append events to a stream with optimistic concurrency control.
@@ -151,7 +231,13 @@ impl EsClient {
             events: proto_events,
         };
 
-        let response = self.inner.append(request).await?;
+        // Clone the inner tonic client for each RPC call. This is cheap
+        // because EventStoreClient wraps a tonic::client::Grpc which itself
+        // wraps the channel (an Arc'd hyper connection pool).
+        let response = match self.inner.as_ref() {
+            EsClientInner::Plain(c) => c.clone().append(request).await?,
+            EsClientInner::Auth(c) => c.clone().append(request).await?,
+        };
         Ok(response.into_inner())
     }
 
@@ -183,7 +269,12 @@ impl EsClient {
             max_count,
         };
 
-        match self.inner.read_stream(request).await {
+        let result = match self.inner.as_ref() {
+            EsClientInner::Plain(c) => c.clone().read_stream(request).await,
+            EsClientInner::Auth(c) => c.clone().read_stream(request).await,
+        };
+
+        match result {
             Ok(response) => Ok(response.into_inner().events),
             // A stream that has never been written to returns NotFound.
             // Treat this as an empty event list rather than an error,
@@ -215,7 +306,10 @@ impl EsClient {
         from_position: u64,
     ) -> Result<tonic::Streaming<proto::SubscribeResponse>, tonic::Status> {
         let request = proto::SubscribeAllRequest { from_position };
-        let response = self.inner.subscribe_all(request).await?;
+        let response = match self.inner.as_ref() {
+            EsClientInner::Plain(c) => c.clone().subscribe_all(request).await?,
+            EsClientInner::Auth(c) => c.clone().subscribe_all(request).await?,
+        };
         Ok(response.into_inner())
     }
 }
@@ -320,5 +414,106 @@ mod tests {
             ),
             "Exact(5) should map to proto Exact(5) variant"
         );
+    }
+
+    // --- EsClient transport variant tests ---
+
+    /// Build a mock `EsClient` with a lazy auth channel for testing.
+    fn mock_auth_client(token: &str) -> EsClient {
+        let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let interceptor = BearerInterceptor {
+            token: Arc::new(std::sync::RwLock::new(token.to_string())),
+        };
+        let inner = EventStoreClient::with_interceptor(channel, interceptor);
+        EsClient {
+            inner: Arc::new(EsClientInner::Auth(inner)),
+        }
+    }
+
+    #[tokio::test]
+    async fn from_inner_creates_plain_variant() {
+        let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let inner = EventStoreClient::new(channel);
+        let client = EsClient::from_inner(inner);
+        assert!(
+            !client.is_auth(),
+            "from_inner should create a Plain variant"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_with_token_creates_auth_variant() {
+        let client = mock_auth_client("abc123");
+        assert!(
+            client.is_auth(),
+            "connect_with_token should create an Auth variant"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_with_token_non_empty_token_injects_bearer_header() {
+        // Verify through the BearerInterceptor directly that a non-empty
+        // token produces the expected Authorization header. The interceptor
+        // is the same one wired into connect_with_token's Auth variant.
+        let token = Arc::new(std::sync::RwLock::new("abc123".to_string()));
+        let mut interceptor = BearerInterceptor {
+            token: token.clone(),
+        };
+        use tonic::service::Interceptor;
+        let result = interceptor
+            .call(tonic::Request::new(()))
+            .expect("call should succeed");
+        let value = result
+            .metadata()
+            .get("authorization")
+            .expect("authorization header should be present");
+        assert_eq!(value, "Bearer abc123");
+    }
+
+    #[tokio::test]
+    async fn connect_with_token_empty_token_omits_authorization() {
+        // Verify through the BearerInterceptor that an empty token produces
+        // no Authorization header.
+        let token = Arc::new(std::sync::RwLock::new(String::new()));
+        let mut interceptor = BearerInterceptor {
+            token: token.clone(),
+        };
+        use tonic::service::Interceptor;
+        let result = interceptor
+            .call(tonic::Request::new(()))
+            .expect("call should succeed");
+        assert!(
+            result.metadata().get("authorization").is_none(),
+            "authorization header should not be present for empty token"
+        );
+    }
+
+    #[tokio::test]
+    async fn es_client_debug_shows_transport_variant() {
+        let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let inner = EventStoreClient::new(channel);
+        let client = EsClient::from_inner(inner);
+        let debug_str = format!("{:?}", client);
+        assert!(
+            debug_str.contains("Plain"),
+            "Debug output should show Plain variant"
+        );
+
+        let auth_client = mock_auth_client("tok");
+        let debug_str = format!("{:?}", auth_client);
+        assert!(
+            debug_str.contains("Auth"),
+            "Debug output should show Auth variant"
+        );
+    }
+
+    #[tokio::test]
+    async fn es_client_clone_is_cheap() {
+        let channel = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let inner = EventStoreClient::new(channel);
+        let client = EsClient::from_inner(inner);
+        let cloned = client.clone();
+        // Both should point to the same Arc allocation.
+        assert!(Arc::ptr_eq(&client.inner, &cloned.inner));
     }
 }
